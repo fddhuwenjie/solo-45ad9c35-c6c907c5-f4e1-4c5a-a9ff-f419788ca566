@@ -1,4 +1,4 @@
-"""sqlite3 存储：数据集、数据点、分析版本、剔除记录。"""
+"""sqlite3 存储：数据集、数据点、分析版本、剔除记录、批次版本。"""
 
 from __future__ import annotations
 
@@ -43,6 +43,16 @@ CREATE TABLE IF NOT EXISTS exclusions (
     reason TEXT NOT NULL,
     created_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS batch_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dataset_id INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    note TEXT DEFAULT '',
+    params_json TEXT NOT NULL,
+    cycles_json TEXT NOT NULL,
+    summary_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_batch_versions_ds ON batch_versions(dataset_id, id);
 """
 
 
@@ -88,7 +98,7 @@ def get_points(conn, ds_id):
 
 
 def delete_dataset(conn, ds_id):
-    for tbl in ("points", "versions", "exclusions"):
+    for tbl in ("points", "versions", "exclusions", "batch_versions"):
         conn.execute(f"DELETE FROM {tbl} WHERE dataset_id=?", (ds_id,))
     conn.execute("DELETE FROM datasets WHERE id=?", (ds_id,))
     conn.commit()
@@ -140,6 +150,62 @@ def undo_version(conn, ds_id):
         "params": json.loads(current["params_json"]),
         "result": json.loads(current["result_json"]),
     }
+
+
+# ------------------------------------------------------------------ 批次版本
+
+def save_batch_version(conn, ds_id, params, cycles, summary, note=""):
+    """保存一次多周期批量分析快照，返回版本 id。"""
+    cur = conn.execute(
+        "INSERT INTO batch_versions(dataset_id, created_at, note, params_json,"
+        " cycles_json, summary_json) VALUES (?,?,?,?,?,?)",
+        (ds_id, time.time(), note, json.dumps(params, ensure_ascii=False),
+         json.dumps(cycles, ensure_ascii=False),
+         json.dumps(summary, ensure_ascii=False)))
+    conn.commit()
+    return cur.lastrowid
+
+
+def _batch_row(r):
+    return {"id": r["id"], "created_at": r["created_at"], "note": r["note"],
+            "params": json.loads(r["params_json"]),
+            "cycles": json.loads(r["cycles_json"]),
+            "summary": json.loads(r["summary_json"])}
+
+
+def list_batch_versions(conn, ds_id):
+    rows = conn.execute(
+        "SELECT id, created_at, note, params_json, cycles_json, summary_json"
+        " FROM batch_versions WHERE dataset_id=? ORDER BY id", (ds_id,)
+    ).fetchall()
+    return [_batch_row(r) for r in rows]
+
+
+def get_batch_version(conn, vid):
+    r = conn.execute(
+        "SELECT id, created_at, note, params_json, cycles_json, summary_json"
+        " FROM batch_versions WHERE id=?", (vid,)).fetchone()
+    return _batch_row(r) if r else None
+
+
+def undo_batch_version(conn, ds_id):
+    """删除最新批次版本并回退；返回 (ok, message, current)，current 可为 None。"""
+    rows = conn.execute(
+        "SELECT id FROM batch_versions WHERE dataset_id=? ORDER BY id",
+        (ds_id,)).fetchall()
+    if not rows:
+        return False, "没有可撤销的批次版本", None
+    conn.execute("DELETE FROM batch_versions WHERE id=?", (rows[-1]["id"],))
+    conn.commit()
+    if len(rows) == 1:
+        return True, "已撤销，批次结果已清空", None
+    cur = conn.execute(
+        "SELECT params_json, cycles_json, summary_json FROM batch_versions"
+        " WHERE id=?", (rows[-2]["id"],)).fetchone()
+    return True, "已撤销到上一批次版本", {
+        "params": json.loads(cur["params_json"]),
+        "cycles": json.loads(cur["cycles_json"]),
+        "summary": json.loads(cur["summary_json"])}
 
 
 # ------------------------------------------------------------------ 剔除

@@ -164,16 +164,14 @@ def linregress(xs, ys):
     return slope, intercept, r2, residuals
 
 
-def analyze(points, window, calib_points=None, blank_rate=None,
-            blank_volume=None, r2_threshold=0.9, min_points=5):
-    """完整分析流程。返回结果字典（含 warnings 列表）。
+def analyze_window(corrected, window, blank_rate=None, blank_volume=None,
+                   r2_threshold=0.9, min_points=5):
+    """在已修正曲线上分析一个测量窗口，返回结果字典（含 warnings 列表）。
 
     window: (t0, t1)；blank_rate: 空白室耗氧率 mg/h（已换算）；
     blank_volume: 空白室体积 L。
     """
     warnings = []
-    calib_points = calib_points or []
-    corrected = drift_correct([dict(p) for p in points], calib_points)
 
     t0, t1 = window
     if t1 < t0:
@@ -183,7 +181,7 @@ def analyze(points, window, calib_points=None, blank_rate=None,
 
     in_win = [p for p in corrected if t0 <= p["t"] <= t1]
 
-    # 时间倒序检查（全程与窗内）
+    # 时间倒序检查（窗内）
     ts = [p["t"] for p in in_win]
     if any(b < a for a, b in zip(ts, ts[1:])):
         warnings.append({"code": "TIME_REVERSED",
@@ -205,8 +203,6 @@ def analyze(points, window, calib_points=None, blank_rate=None,
         "window": [t0, t1],
         "n": n,
         "warnings": warnings,
-        "corrected": corrected,
-        "calib_points": calib_points,
     }
     if n < 2:
         result["error"] = "窗口内点数不足，无法回归"
@@ -259,3 +255,225 @@ def analyze(points, window, calib_points=None, blank_rate=None,
         "o2_sat": o2_saturation(mean_temp, mean_press),
     })
     return result
+
+
+def analyze(points, window, calib_points=None, blank_rate=None,
+            blank_volume=None, r2_threshold=0.9, min_points=5):
+    """完整单窗分析流程：漂移修正 + 窗口分析。返回结果字典（含 warnings）。"""
+    calib_points = calib_points or []
+    corrected = drift_correct([dict(p) for p in points], calib_points)
+    result = analyze_window(corrected, window, blank_rate=blank_rate,
+                            blank_volume=blank_volume,
+                            r2_threshold=r2_threshold, min_points=min_points)
+    result["corrected"] = corrected
+    result["calib_points"] = calib_points
+    return result
+
+
+# ---------------------------------------------------------------- 自动分段
+
+def _o2_of(p):
+    return p.get("o2_corr", p["o2"])
+
+
+def _rise_bounds(points, threshold, min_duration):
+    """氧浓度回升（冲洗）区段的末端时刻列表。
+
+    相邻点升高速率超过 threshold (mg/L/s) 视为上升；连续上升区段
+    持续时间短于 min_duration (s) 的视为噪声忽略。
+    """
+    pts = sorted(points, key=lambda p: p["t"])
+    n = len(pts)
+    rising = []
+    for i in range(n - 1):
+        dt = pts[i + 1]["t"] - pts[i]["t"]
+        rising.append(dt > 0 and
+                      (_o2_of(pts[i + 1]) - _o2_of(pts[i])) / dt > threshold)
+    bounds = []
+    i = 0
+    while i < n - 1:
+        if not rising[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < n - 1 and rising[j + 1]:
+            j += 1
+        if pts[j + 1]["t"] - pts[i]["t"] >= min_duration:
+            bounds.append(pts[j + 1]["t"])
+        i = j + 1
+    return bounds
+
+
+def segment(points, seg):
+    """按分段规则生成候选测量周期 [{start, end}, ...]。
+
+    seg 字段：
+      method            "event"（flush 事件）或 "rise"（氧浓度回升阈值）
+      event_keyword     事件关键字（默认 flush，不区分大小写）
+      rise_threshold    回升速率阈值 mg/L/s（method=rise）
+      rise_min_duration 回升区段最短持续 s（method=rise）
+      flush_offset      边界后跳过 s（冲洗/换水平稳时间）
+      end_margin        下一边界前预留 s
+      min_duration      首末段短于该值则舍弃（记录可能未覆盖完整周期）
+    """
+    if not points:
+        return []
+    offset = float(seg.get("flush_offset", 60.0))
+    margin = float(seg.get("end_margin", 5.0))
+    min_dur = float(seg.get("min_duration", 60.0))
+    ts = [p["t"] for p in points]
+    t0, t1 = min(ts), max(ts)
+    if seg.get("method") == "rise":
+        bounds = _rise_bounds(points,
+                              float(seg.get("rise_threshold", 0.01)),
+                              float(seg.get("rise_min_duration", 0.0)))
+    else:
+        kw = (seg.get("event_keyword") or "flush").strip().lower()
+        bounds = sorted(p["t"] for p in points
+                        if p.get("event") and kw in p["event"].lower())
+    bounds = [b for b in bounds if t0 < b < t1]
+    if not bounds:
+        return []
+    starts = [t0] + bounds
+    out = []
+    for i, s in enumerate(starts):
+        a = s + offset
+        e = (bounds[i] - margin) if i < len(bounds) else t1
+        if e <= a:
+            continue
+        if i in (0, len(starts) - 1) and (e - a) < min_dur:
+            continue
+        out.append({"start": a, "end": e})
+    return out
+
+
+def merge_locked_cycles(existing, candidates):
+    """锁定周期原样保留；候选周期只补入未与锁定周期重叠的区域。"""
+    locked = [c for c in existing if c.get("locked")]
+
+    def blocked(c):
+        return any(float(c["start"]) < float(L["end"]) and
+                   float(L["start"]) < float(c["end"]) for L in locked)
+
+    merged = [dict(L) for L in locked]
+    for c in candidates:
+        if not blocked(c):
+            merged.append({"start": float(c["start"]), "end": float(c["end"]),
+                           "locked": False, "decision": None, "reason": ""})
+    merged.sort(key=lambda c: (float(c["start"]), float(c["end"])))
+    return merged
+
+
+# ---------------------------------------------------------------- 批量分析
+
+# 出现任一即判定周期“自动无效”的告警（用户可裁决保留）
+BLOCKING_CODES = ("CYCLE_OVERLAP", "CYCLE_TOO_SHORT", "TOO_FEW_POINTS",
+                  "LOW_R2", "EVENT_IN_WINDOW", "TIME_REVERSED", "SIGN_FLIP",
+                  "RATE_OUTLIER")
+
+
+def _median(xs):
+    s = sorted(xs)
+    n = len(s)
+    if n == 0:
+        return None
+    m = n // 2
+    return s[m] if n % 2 else (s[m - 1] + s[m]) / 2.0
+
+
+def analyze_cycles(corrected, cycles, blank_rate=None, blank_volume=None,
+                   r2_threshold=0.9, min_points=5, min_duration=60.0,
+                   mad_threshold=3.5):
+    """批量分析一组周期边界。
+
+    cycles: [{start, end, locked, decision, reason}, ...]
+      decision: None=自动 / "keep"=保留 / "exclude"=剔除（reason 为理由）。
+    返回 {"cycles": [...含结果与告警...], "summary": {...}}。
+    """
+    cycles = sorted(cycles,
+                    key=lambda c: (float(c["start"]), float(c["end"])))
+    # 重叠检测（相邻周期）
+    overlap = [False] * len(cycles)
+    for i in range(len(cycles) - 1):
+        if float(cycles[i]["end"]) > float(cycles[i + 1]["start"]) + 1e-9:
+            overlap[i] = overlap[i + 1] = True
+
+    out = []
+    for i, c in enumerate(cycles):
+        start, end = float(c["start"]), float(c["end"])
+        res = analyze_window(corrected, (start, end), blank_rate=blank_rate,
+                             blank_volume=blank_volume,
+                             r2_threshold=r2_threshold, min_points=min_points)
+        warnings = list(res["warnings"])
+        if overlap[i]:
+            warnings.append({"code": "CYCLE_OVERLAP",
+                             "msg": "与相邻周期时间重叠，请拖动边界消除"})
+        dur = abs(end - start)
+        if dur < min_duration:
+            warnings.append({"code": "CYCLE_TOO_SHORT",
+                             "msg": f"测量段 {dur:.0f}s 短于下限 {min_duration:.0f}s"})
+        decision = c.get("decision")
+        out.append({
+            "id": i + 1,
+            "start": res["window"][0], "end": res["window"][1],
+            "locked": bool(c.get("locked")),
+            "decision": decision if decision in ("keep", "exclude") else None,
+            "reason": c.get("reason", "") or "",
+            "result": res,
+            "warnings": warnings,
+            "outlier_z": None,
+        })
+
+    # MAD 离群识别：在其余质量合格的周期中检验速率
+    pool = [c for c in out if c["result"].get("mo2_net") is not None
+            and not any(w["code"] in BLOCKING_CODES for w in c["warnings"])]
+    if len(pool) >= 4:
+        rates = [c["result"]["mo2_net"] for c in pool]
+        med = _median(rates)
+        mad = _median([abs(r - med) for r in rates])
+        if mad and mad > 0:
+            for c in pool:
+                z = 0.6745 * (c["result"]["mo2_net"] - med) / mad
+                c["outlier_z"] = z
+                if abs(z) > mad_threshold:
+                    c["warnings"].append({
+                        "code": "RATE_OUTLIER",
+                        "msg": (f"速率离群：修正 z={z:.2f}，|z|>{mad_threshold}"
+                                "（基于中位数绝对偏差），请裁决保留或剔除")})
+
+    # 计入汇总标记
+    for c in out:
+        blocked = any(w["code"] in BLOCKING_CODES for w in c["warnings"])
+        c["auto_valid"] = c["result"].get("mo2_net") is not None and not blocked
+        if c["decision"] == "keep":
+            c["included"] = c["result"].get("mo2_net") is not None
+        elif c["decision"] == "exclude":
+            c["included"] = False
+        else:
+            c["included"] = c["auto_valid"]
+
+    return {"cycles": out, "summary": summarize_cycles(out)}
+
+
+def summarize_cycles(cycles):
+    """有效（计入）周期 MO₂ 的均值、标准差、变异系数等。"""
+    inc = [c for c in cycles if c.get("included")
+           and c["result"].get("mo2_net") is not None]
+    rates = [c["result"]["mo2_net"] for c in inc]
+    vols = [c["result"]["volume"] for c in inc
+            if c["result"].get("volume") is not None]
+    n = len(rates)
+    summary = {"n_total": len(cycles), "n_included": n,
+               "n_excluded": len(cycles) - n,
+               "mean": None, "std": None, "cv": None, "median": None,
+               "volume": sum(vols) / len(vols) if vols else None}
+    if n:
+        mean = sum(rates) / n
+        summary["mean"] = mean
+        summary["median"] = _median(rates)
+        if n > 1:
+            var = sum((r - mean) ** 2 for r in rates) / (n - 1)
+            summary["std"] = math.sqrt(var)
+            if mean:
+                summary["cv"] = summary["std"] / mean * 100.0
+    return summary
