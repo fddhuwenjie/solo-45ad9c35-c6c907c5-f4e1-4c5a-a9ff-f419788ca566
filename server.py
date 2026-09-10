@@ -521,11 +521,19 @@ def api_batch_analyze(environ):
               "r2_threshold": r2_threshold,
               "min_points": min_points, "min_duration": min_duration}
     version_id = None
+    propagation = []
     if payload.get("save"):
+        meta = db.get_dataset(conn, ds_id)
+        is_blank = bool(meta and meta["is_blank"])
+        eff_before = _blank_effective(conn, ds_id) if is_blank else None
         version_id = db.save_batch_version(
             conn, ds_id, params,
             [_cycle_store(c) for c in batch["cycles"]], batch["summary"],
             note=payload.get("note", ""))
+        if is_blank:
+            # 空白室新增已确认批次：有效均值变化时提升序列 rev 并重算关联样本
+            propagation = _propagate_blank_update(
+                conn, ds_id, eff_before, _blank_effective(conn, ds_id))
     versions = _slim_batch_versions(db.list_batch_versions(conn, ds_id))
     conn.close()
     return {"ok": True, "params": params,
@@ -533,6 +541,7 @@ def api_batch_analyze(environ):
             "summary": batch["summary"], "corrected": corrected,
             "blank_series": blank_info,
             "n_candidates": n_candidates, "version_id": version_id,
+            "blank_propagation": propagation,
             "versions": versions}, None
 
 
@@ -540,10 +549,19 @@ def api_batch_undo(environ):
     payload = json.loads(read_body(environ).decode("utf-8"))
     ds_id = int(payload["dataset_id"])
     conn = get_conn()
+    meta = db.get_dataset(conn, ds_id)
+    is_blank = bool(meta and meta["is_blank"])
+    eff_before = _blank_effective(conn, ds_id) if is_blank else None
     ok, msg, current = db.undo_batch_version(conn, ds_id)
+    propagation = []
+    if ok and is_blank:
+        # 撤销空白批次同样可能改变有效均值，需同步序列与关联样本
+        propagation = _propagate_blank_update(
+            conn, ds_id, eff_before, _blank_effective(conn, ds_id))
     versions = _slim_batch_versions(db.list_batch_versions(conn, ds_id))
     conn.close()
     return {"ok": ok, "message": msg, "current": current,
+            "blank_propagation": propagation,
             "versions": versions}
 
 
@@ -623,6 +641,47 @@ def _recompute_affected(conn, series_id, new_rev):
         affected.append({"dataset_id": d["id"], "name": d["name"],
                          "from_version": v["id"], "new_version": vid})
     return affected
+
+
+def _blank_effective(conn, blank_id):
+    """空白室当前有效均值与体积（最近已确认批次版本）。"""
+    bvs = db.list_batch_versions(conn, blank_id)
+    if bvs:
+        s = bvs[-1]["summary"]
+        return s.get("mean"), s.get("volume")
+    return None, None
+
+
+def _eff_equal(a, b, eps=1e-9):
+    for x, y in zip(a, b):
+        if x is None or y is None:
+            if x is not y:
+                return False
+        elif abs(x - y) > eps:
+            return False
+    return True
+
+
+def _propagate_blank_update(conn, blank_id, eff_before, eff_after):
+    """空白室有效均值变化后：提升引用它的序列 rev 并重算受影响样本。
+
+    只处理未停用且未锁定的锚点（锁定锚点不受来源批次变化影响）；
+    均值未变则不产生任何版本。返回传播记录
+    [{series_id, series_rev, affected}]。"""
+    if _eff_equal(eff_before, eff_after):
+        return []
+    propagated = []
+    for s in db.list_series(conn):
+        hit = any(a["blank_dataset_id"] == blank_id
+                  and not a["disabled"] and a["locked_rate"] is None
+                  for a in s["anchors"])
+        if not hit:
+            continue
+        new_rev = db.bump_series_rev(conn, s["id"])
+        affected = _recompute_affected(conn, s["id"], new_rev)
+        propagated.append({"series_id": s["id"], "series_rev": new_rev,
+                           "affected": affected})
+    return propagated
 
 
 def _csv_cell(s):

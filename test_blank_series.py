@@ -330,5 +330,159 @@ class SeriesAffectedTest(unittest.TestCase):
         conn.close()
 
 
+class BlankPropagationTest(unittest.TestCase):
+    """空白室新增/撤销已确认批次 → 序列 rev 与关联样本版本同步更新。"""
+
+    def setUp(self):
+        fd, self.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        os.environ["RESPIRO_DB"] = self.path
+        db.DB_PATH = self.path
+
+    def tearDown(self):
+        os.unlink(self.path)
+
+    @staticmethod
+    def _post(fn, payload):
+        body = json.dumps(payload).encode()
+        env = {"wsgi.input": io.BytesIO(body),
+               "CONTENT_LENGTH": str(len(body))}
+        out, err = fn(env)
+        assert err is None, err
+        return out
+
+    def _blank_with_batch(self, conn, calib=None):
+        """空白数据集 + 一个已确认批次，返回 (blank_id, cycles, mean)。"""
+        pts = make_run([0.03])
+        bid = db.create_dataset(conn, "blank", "", True, "b.csv", pts)
+        _, segs = seg_of(pts)
+        payload = {"dataset_id": bid, "resegment": False, "cycles": segs,
+                   "save": True, "min_duration": 60}
+        if calib:
+            payload["calib_points"] = calib
+        out = self._post(server.api_batch_analyze, payload)
+        return bid, segs, out["summary"]["mean"]
+
+    def _sample_with_series(self, conn, sid, rates=(0.4, 0.4)):
+        pts = make_run(list(rates))
+        sample_id = db.create_dataset(conn, "fish", "F", False, "s.csv", pts)
+        _, segs = seg_of(pts)
+        return sample_id, self._post(server.api_batch_analyze, {
+            "dataset_id": sample_id, "resegment": False, "cycles": segs,
+            "blank_series_id": sid, "save": True, "min_duration": 60})
+
+    def test_new_blank_batch_propagates_to_samples(self):
+        conn = db.connect()
+        blank_id, segs, mean1 = self._blank_with_batch(conn)
+        out = self._post(server.api_series_save, {
+            "name": "背景", "method": "nearest", "max_gap_s": 0,
+            "anchors": [{"blank_dataset_id": blank_id, "collected_at": 0}]})
+        sid = out["series"]["id"]
+        sample_id, out1 = self._sample_with_series(conn, sid)
+        rate_v1 = out1["cycles"][0]["result"]["blank"]["rate"]
+        self.assertAlmostEqual(rate_v1, mean1, places=9)
+        # 空白新增确认批次（校准点引入趋势 → 有效均值变化）
+        out2 = self._post(server.api_batch_analyze, {
+            "dataset_id": blank_id, "resegment": False, "cycles": segs,
+            "calib_points": [[0, 8.6], [600, 8.4]],
+            "save": True, "min_duration": 60})
+        mean2 = out2["summary"]["mean"]
+        self.assertNotAlmostEqual(mean1, mean2, places=6)
+        # 传播发生且指向本序列
+        prop = out2["blank_propagation"]
+        self.assertEqual(len(prop), 1)
+        self.assertEqual(prop[0]["series_id"], sid)
+        self.assertEqual(prop[0]["series_rev"], 2)
+        self.assertEqual([a["dataset_id"] for a in prop[0]["affected"]],
+                         [sample_id])
+        # 序列 rev 提升
+        self.assertEqual(db.get_series(conn, sid)["rev"], 2)
+        # 样本生成关联新版本，blank_rate 同步为新均值；旧版本仍可查阅
+        versions = db.list_batch_versions(conn, sample_id)
+        self.assertEqual(len(versions), 2)
+        self.assertEqual(versions[-1]["params"]["series_rev"], 2)
+        self.assertEqual(versions[-1]["params"]["auto_from_version"],
+                         versions[0]["id"])
+        rate_v2 = versions[-1]["cycles"][0]["result"]["blank"]["rate"]
+        self.assertAlmostEqual(rate_v2, mean2, places=9)
+        self.assertNotAlmostEqual(rate_v1, rate_v2, places=6)
+        self.assertAlmostEqual(
+            versions[0]["cycles"][0]["result"]["blank"]["rate"],
+            rate_v1, places=9)
+        # 序列当前解析值与已存校正结果一致
+        listed = server.api_series_list({})
+        cur = listed["series"][0]["anchors"][0]["rate"]
+        self.assertAlmostEqual(cur, rate_v2, places=9)
+        conn.close()
+
+    def test_locked_anchor_immune_to_source_batch(self):
+        conn = db.connect()
+        blank_id, segs, _ = self._blank_with_batch(conn)
+        out = self._post(server.api_series_save, {
+            "name": "背景", "method": "nearest", "max_gap_s": 0,
+            "anchors": [{"blank_dataset_id": blank_id, "collected_at": 0,
+                         "locked_rate": 0.04}]})
+        sid = out["series"]["id"]
+        sample_id, _ = self._sample_with_series(conn, sid)
+        # 空白新增确认批次（均值变化）→ 锁定锚点不受影响
+        out2 = self._post(server.api_batch_analyze, {
+            "dataset_id": blank_id, "resegment": False, "cycles": segs,
+            "calib_points": [[0, 8.6], [600, 8.4]],
+            "save": True, "min_duration": 60})
+        self.assertEqual(out2["blank_propagation"], [])
+        self.assertEqual(db.get_series(conn, sid)["rev"], 1)
+        versions = db.list_batch_versions(conn, sample_id)
+        self.assertEqual(len(versions), 1)
+        self.assertAlmostEqual(
+            versions[0]["cycles"][0]["result"]["blank"]["rate"], 0.04, places=9)
+        conn.close()
+
+    def test_unchanged_mean_no_propagation(self):
+        conn = db.connect()
+        blank_id, segs, _ = self._blank_with_batch(conn)
+        out = self._post(server.api_series_save, {
+            "name": "背景", "method": "nearest", "max_gap_s": 0,
+            "anchors": [{"blank_dataset_id": blank_id, "collected_at": 0}]})
+        sid = out["series"]["id"]
+        sample_id, _ = self._sample_with_series(conn, sid)
+        # 相同参数再保存一次 → 均值未变 → 无传播
+        out2 = self._post(server.api_batch_analyze, {
+            "dataset_id": blank_id, "resegment": False, "cycles": segs,
+            "save": True, "min_duration": 60})
+        self.assertEqual(out2["blank_propagation"], [])
+        self.assertEqual(db.get_series(conn, sid)["rev"], 1)
+        self.assertEqual(len(db.list_batch_versions(conn, sample_id)), 1)
+        conn.close()
+
+    def test_blank_batch_undo_propagates(self):
+        conn = db.connect()
+        blank_id, segs, mean1 = self._blank_with_batch(conn)
+        out = self._post(server.api_series_save, {
+            "name": "背景", "method": "nearest", "max_gap_s": 0,
+            "anchors": [{"blank_dataset_id": blank_id, "collected_at": 0}]})
+        sid = out["series"]["id"]
+        sample_id, _ = self._sample_with_series(conn, sid)
+        # 第二批（均值变化）→ rev 2，样本 v2
+        self._post(server.api_batch_analyze, {
+            "dataset_id": blank_id, "resegment": False, "cycles": segs,
+            "calib_points": [[0, 8.6], [600, 8.4]],
+            "save": True, "min_duration": 60})
+        # 撤销空白第二批 → 有效均值回退 → 再次传播
+        body = json.dumps({"dataset_id": blank_id}).encode()
+        out = server.api_batch_undo(
+            {"wsgi.input": io.BytesIO(body),
+             "CONTENT_LENGTH": str(len(body))})
+        self.assertTrue(out["ok"])
+        self.assertEqual(len(out["blank_propagation"]), 1)
+        self.assertEqual(db.get_series(conn, sid)["rev"], 3)
+        versions = db.list_batch_versions(conn, sample_id)
+        self.assertEqual(len(versions), 3)
+        self.assertEqual(versions[-1]["params"]["series_rev"], 3)
+        self.assertAlmostEqual(
+            versions[-1]["cycles"][0]["result"]["blank"]["rate"],
+            mean1, places=9)
+        conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()

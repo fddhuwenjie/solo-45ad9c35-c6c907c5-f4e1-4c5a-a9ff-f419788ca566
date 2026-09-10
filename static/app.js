@@ -686,7 +686,9 @@ async function runBatch(resegment, save) {
     if (save) {
       const msg = $("#batch-save-msg");
       msg.className = "msg";
-      msg.textContent = `已保存批次版本 v${data.version_id}（可撤销）`;
+      msg.textContent = `已保存批次版本 v${data.version_id}（可撤销）` +
+        propagationText(data.blank_propagation);
+      if ((data.blank_propagation || []).length) loadDatasets();
       $("#batch-note").value = "";
     }
     return data;
@@ -694,6 +696,14 @@ async function runBatch(resegment, save) {
     alert("批量分析失败: " + e.message);
     return null;
   }
+}
+
+// 空白批次更新传播到背景序列的提示
+function propagationText(prop) {
+  if (!prop || !prop.length) return "";
+  const n = prop.reduce((s, p) => s + (p.affected ? p.affected.length : 0), 0);
+  const revs = prop.map((p) => `序列#${p.series_id} rev${p.series_rev}`).join("、");
+  return `；空白有效均值更新已传播（${revs}），${n} 个关联样本已自动重算`;
 }
 
 $("#btn-segment").addEventListener("click", () => runBatch(true, false));
@@ -717,7 +727,9 @@ $("#btn-batch-undo").addEventListener("click", async () => {
     renderBatchTable(); renderBatchSummary();
   }
   const msg = $("#batch-save-msg");
-  msg.className = "msg"; msg.textContent = data.message;
+  msg.className = "msg";
+  msg.textContent = data.message + propagationText(data.blank_propagation);
+  if ((data.blank_propagation || []).length) loadDatasets();
 });
 
 // ---------------- 总览图 ----------------
