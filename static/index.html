@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>间歇式呼吸室分析工作台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>间歇式呼吸室分析工作台</h1>
+  <nav>
+    <button class="tab active" data-view="analyze">曲线分析</button>
+    <button class="tab" data-view="groups">分组比较</button>
+  </nav>
+</header>
+
+<!-- ==================== 分析视图 ==================== -->
+<main id="view-analyze" class="view">
+  <aside id="sidebar">
+    <section class="panel">
+      <h2>上传 CSV</h2>
+      <input type="file" id="file-input" accept=".csv">
+      <label>数据集名称 <input id="up-name" placeholder="如 fish_A_run1"></label>
+      <label>样本编号 <input id="up-sample" placeholder="如 fish_A"></label>
+      <label class="row"><input type="checkbox" id="up-blank"> 空白室</label>
+      <button id="btn-upload">上传</button>
+      <div id="upload-msg" class="msg"></div>
+    </section>
+
+    <section class="panel">
+      <h2>数据集</h2>
+      <ul id="dataset-list" class="ds-list"></ul>
+    </section>
+
+    <section class="panel">
+      <h2>分析参数</h2>
+      <label>空白室
+        <select id="sel-blank"><option value="">（不使用）</option></select>
+      </label>
+      <label>R² 阈值 <input id="in-r2" type="number" step="0.01" value="0.90"></label>
+      <label>最少点数 <input id="in-minpts" type="number" step="1" value="5"></label>
+      <label>版本备注 <input id="in-note" placeholder="可选"></label>
+      <div class="btn-row">
+        <button id="btn-analyze" class="primary">运行分析</button>
+        <button id="btn-undo" title="撤销上一次调整">撤销</button>
+      </div>
+      <div class="btn-row">
+        <button id="btn-calib-mode">添加校准点</button>
+        <button id="btn-clear-calib">清空校准点</button>
+      </div>
+      <div class="btn-row">
+        <button id="btn-clear-window">清除窗口</button>
+      </div>
+      <p class="hint">在图上<b>拖动</b>选择稳态窗；开启“添加校准点”后<b>点击</b>曲线放置校准点（期望值默认为该时刻温压对应的饱和浓度）。</p>
+    </section>
+
+    <section class="panel">
+      <h2>版本历史</h2>
+      <ul id="version-list" class="ver-list"></ul>
+    </section>
+
+    <section class="panel">
+      <h2>导出</h2>
+      <div class="btn-col">
+        <a id="exp-csv" href="#" download>修正曲线 CSV</a>
+        <a id="exp-json" href="#" download>窗口参数 JSON</a>
+        <a id="exp-report" href="#" target="_blank">实验报告（带图）</a>
+      </div>
+    </section>
+  </aside>
+
+  <section id="main-area">
+    <div id="plot-wrap">
+      <svg id="plot" width="900" height="380"></svg>
+      <svg id="resid-plot" width="900" height="130"></svg>
+    </div>
+    <div id="warnings" class="warnings"></div>
+    <div id="stats" class="stats"></div>
+  </section>
+</main>
+
+<!-- ==================== 分组视图 ==================== -->
+<main id="view-groups" class="view hidden">
+  <section class="panel wide">
+    <h2>同样本多次测量归组比较</h2>
+    <button id="btn-refresh-groups">刷新</button>
+    <div id="groups-table"></div>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
