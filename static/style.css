@@ -16,7 +16,7 @@ header h1 { font-size: 18px; margin: 0; }
 .view { display: flex; gap: 14px; padding: 14px; align-items: flex-start; }
 .hidden { display: none !important; }
 
-#sidebar { width: 300px; flex-shrink: 0; display: flex; flex-direction: column; gap: 12px; }
+#sidebar, #batch-sidebar { width: 300px; flex-shrink: 0; display: flex; flex-direction: column; gap: 12px; }
 .panel {
   background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 12px 14px;
 }
@@ -54,10 +54,10 @@ button.armed { background: #b3540e; color: #fff; border-color: #b3540e; }
 .ver-list li { padding: 4px 6px; border-bottom: 1px solid #eee; font-size: 12px; }
 .ver-list .vnote { color: #666; }
 
-#main-area { flex: 1; min-width: 0; }
-#plot-wrap { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 10px; overflow-x: auto; }
-#plot { cursor: crosshair; display: block; }
-#resid-plot { display: block; margin-top: 6px; border-top: 1px dashed #ccc; }
+#main-area, #batch-main { flex: 1; min-width: 0; }
+#plot-wrap, #batch-plot-wrap { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 10px; overflow-x: auto; }
+#plot, #batch-plot { cursor: crosshair; display: block; }
+#resid-plot, #batch-resid { display: block; margin-top: 6px; border-top: 1px dashed #ccc; }
 
 .warnings { margin-top: 10px; }
 .warnings .warn {
@@ -80,3 +80,44 @@ button.armed { background: #b3540e; color: #fff; border-color: #b3540e; }
 #groups-table th { background: #eef2f7; }
 #groups-table .excluded { color: #999; text-decoration: line-through; }
 #groups-table .reason { color: #b3540e; font-size: 12px; }
+
+/* ---------------- 批量分析 ---------------- */
+.seg-hidden { display: none; }
+
+.batch-summary { display: flex; gap: 10px; margin-top: 10px; flex-wrap: wrap; }
+.sum-card {
+  background: #fff; border: 1px solid #ddd; border-radius: 6px;
+  padding: 8px 16px; text-align: center; min-width: 110px;
+}
+.sum-v { font-size: 18px; font-weight: 600; color: #1f3a5f; }
+.sum-k { font-size: 12px; color: #666; margin-top: 2px; }
+
+.batch-chips { margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap; }
+.chip {
+  background: #fdf3e7; border: 1px solid #e8c48a; color: #8a4b08;
+  border-radius: 10px; padding: 2px 10px; font-size: 12px;
+}
+
+.batch-table {
+  margin-top: 10px; overflow-x: auto; background: #fff;
+  border: 1px solid #ddd; border-radius: 6px; padding: 10px;
+}
+.batch-table table { border-collapse: collapse; width: 100%; font-size: 12px; }
+.batch-table th, .batch-table td {
+  border: 1px solid #ccc; padding: 3px 8px; white-space: nowrap;
+}
+.batch-table th { background: #eef2f7; }
+.batch-table tbody tr { cursor: pointer; }
+.batch-table tbody tr:hover td { background: #f4f7fb; }
+.batch-table tr.excluded td { color: #999; background: #fafafa; }
+.batch-table tr.selected td { background: #e8f0fa; }
+.batch-table td.bad { color: #b3271e; font-weight: 600; }
+.batch-table .warns { max-width: 220px; white-space: normal; }
+.wtag {
+  display: inline-block; background: #fdf3e7; color: #8a4b08;
+  border-radius: 3px; padding: 0 4px; margin: 1px; font-size: 11px; cursor: help;
+}
+.outlier { color: #b3271e; font-weight: 700; }
+.batch-table .reason { color: #1f3a5f; cursor: text; text-decoration: underline dotted; }
+.btn-lock, .btn-del { padding: 1px 6px; font-size: 12px; }
+.sel-decision { font-size: 12px; }

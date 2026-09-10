@@ -11,6 +11,7 @@
   <h1>间歇式呼吸室分析工作台</h1>
   <nav>
     <button class="tab active" data-view="analyze">曲线分析</button>
+    <button class="tab" data-view="batch">批量分析</button>
     <button class="tab" data-view="groups">分组比较</button>
   </nav>
 </header>
@@ -77,6 +78,85 @@
     </div>
     <div id="warnings" class="warnings"></div>
     <div id="stats" class="stats"></div>
+  </section>
+</main>
+
+<!-- ==================== 批量分析视图 ==================== -->
+<main id="view-batch" class="view hidden">
+  <aside id="batch-sidebar">
+    <section class="panel">
+      <h2>数据集</h2>
+      <select id="batch-dataset"></select>
+      <p class="hint">与“曲线分析”共用数据集；空白室同样可做批量分析，其均值将作为空白速率。</p>
+    </section>
+
+    <section class="panel">
+      <h2>自动分段规则</h2>
+      <label>分段方式
+        <select id="seg-method">
+          <option value="event">按 flush 事件</option>
+          <option value="rise">按氧浓度回升阈值</option>
+        </select></label>
+      <label id="row-keyword">事件关键字 <input id="seg-keyword" value="flush"></label>
+      <label id="row-rise" class="seg-hidden">回升阈值 (mg/L/s)
+        <input id="seg-rise" type="number" step="0.001" min="0" value="0.01"></label>
+      <label id="row-risedur" class="seg-hidden">回升最短持续 (s)
+        <input id="seg-risedur" type="number" step="1" min="0" value="0"></label>
+      <label>冲洗后跳过 (s) <input id="seg-offset" type="number" step="1" min="0" value="60"></label>
+      <label>周期末预留 (s) <input id="seg-margin" type="number" step="1" min="0" value="5"></label>
+      <label>最短测量段 (s) <input id="seg-mindur" type="number" step="1" min="0" value="60"></label>
+      <div class="btn-row">
+        <button id="btn-segment" class="primary">自动分段</button>
+        <button id="btn-addcycle">添加周期</button>
+      </div>
+      <div id="seg-msg" class="msg"></div>
+      <p class="hint">自动分段只补入<b>未锁定</b>区域的候选周期；🔒 锁定周期的边界不受规则变化影响。点“添加周期”后在总览图上<b>拖动</b>可手动补一个周期。</p>
+    </section>
+
+    <section class="panel">
+      <h2>分析参数</h2>
+      <label>空白室
+        <select id="batch-blank"><option value="">（不使用）</option></select>
+      </label>
+      <label>R² 阈值 <input id="batch-r2" type="number" step="0.01" value="0.90"></label>
+      <label>最少点数 <input id="batch-minpts" type="number" step="1" value="5"></label>
+      <label>版本备注 <input id="batch-note" placeholder="可选"></label>
+      <div class="btn-row">
+        <button id="btn-batch-recalc">重新计算</button>
+        <button id="btn-batch-save" class="primary">保存版本</button>
+        <button id="btn-batch-undo" title="撤销上一次保存的批次版本">撤销</button>
+      </div>
+      <div class="btn-row">
+        <button id="btn-batch-calib">添加校准点</button>
+        <button id="btn-batch-clear-calib">清空校准点</button>
+      </div>
+      <div id="batch-save-msg" class="msg"></div>
+      <p class="hint">拖动周期两侧的<b>竖线</b>调整起止边界；点击色带选中周期查看残差。带告警的周期默认不计入汇总，可在表中裁决“保留/剔除”并填写理由。</p>
+    </section>
+
+    <section class="panel">
+      <h2>批次版本</h2>
+      <ul id="batch-version-list" class="ver-list"></ul>
+    </section>
+
+    <section class="panel">
+      <h2>导出</h2>
+      <div class="btn-col">
+        <a id="batch-exp-csv" href="#" download>逐周期结果 CSV</a>
+        <a id="batch-exp-json" href="#" download>分段参数 JSON</a>
+        <a id="batch-exp-report" href="#" target="_blank">批次报告（含总览图）</a>
+      </div>
+    </section>
+  </aside>
+
+  <section id="batch-main">
+    <div id="batch-plot-wrap">
+      <svg id="batch-plot" width="1040" height="360"></svg>
+      <svg id="batch-resid" width="1040" height="130"></svg>
+    </div>
+    <div id="batch-summary" class="batch-summary"></div>
+    <div id="batch-warnings" class="batch-chips"></div>
+    <div id="batch-table" class="batch-table"></div>
   </section>
 </main>
 

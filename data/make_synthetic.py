@@ -123,8 +123,31 @@ def blank_chamber():
     write_csv("blank_chamber.csv", rows)
 
 
+def fish_c_run1():
+    """样本C：5 个周期，第 4 周期耗氧率异常偏高（MAD 离群演示）。"""
+    rates = [0.35, 0.36, 0.34, 0.95, 0.35]
+    vol, temp, press = 0.90, 23.0, 101.1
+    rows = []
+    duration = len(rates) * CYCLE
+    for t in range(0, duration + 1, DT):
+        in_cycle = t % CYCLE
+        cyc = min(t // CYCLE, len(rates) - 1)
+        tt = temp + 0.1 * math.sin(t / 700)
+        pp = press + 0.15 * math.sin(t / 900)
+        sat = o2_sat(tt, pp) * 0.985
+        if in_cycle < FLUSH:
+            v = sat
+        else:
+            v = sat - rates[cyc] / 3600.0 / vol * (in_cycle - FLUSH)
+        v += drift_mild(t) + random.gauss(0, 0.004)
+        event = "flush" if in_cycle == 0 and t > 0 else ""
+        rows.append([t, round(v, 4), round(tt, 2), round(pp, 2), vol, event])
+    write_csv("fish_C_run1.csv", rows)
+
+
 if __name__ == "__main__":
     fish_a_run1()
     fish_a_run2()
     fish_b_run1()
     blank_chamber()
+    fish_c_run1()

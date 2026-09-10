@@ -37,6 +37,7 @@ document.querySelectorAll(".tab").forEach((btn) => {
     document.querySelectorAll(".view").forEach((v) => v.classList.add("hidden"));
     $("#view-" + btn.dataset.view).classList.remove("hidden");
     if (btn.dataset.view === "groups") loadGroups();
+    if (btn.dataset.view === "batch") initBatchView();
   });
 });
 
@@ -90,6 +91,26 @@ async function loadDatasets() {
     sel.appendChild(op);
   }
   sel.value = prev;
+  // 批量分析视图：数据集与空白室下拉
+  const bds = $("#batch-dataset");
+  const prevB = bds.value;
+  bds.innerHTML = "";
+  for (const d of data.datasets) {
+    const op = document.createElement("option");
+    op.value = d.id;
+    op.textContent = d.name + (d.is_blank ? "（空白）" : "");
+    bds.appendChild(op);
+  }
+  bds.value = prevB;
+  const bb = $("#batch-blank");
+  const prevBB = bb.value;
+  bb.innerHTML = '<option value="">（不使用）</option>';
+  for (const d of data.datasets.filter((x) => x.is_blank)) {
+    const op = document.createElement("option");
+    op.value = d.id; op.textContent = d.name;
+    bb.appendChild(op);
+  }
+  bb.value = prevBB;
 }
 
 async function selectDataset(id) {
@@ -131,19 +152,19 @@ function updateExportLinks() {
 
 const PLOT = { w: 900, h: 380, ml: 60, mr: 15, mt: 15, mb: 38 };
 
-function scales(points) {
+function scales(points, cfg) {
   const ts = points.map((p) => p.t);
   const ys = points.map((p) => (p.o2_corr !== undefined ? p.o2_corr : p.o2));
   let t0 = Math.min(...ts), t1 = Math.max(...ts);
   let y0 = Math.min(...ys), y1 = Math.max(...ys);
   const pad = (y1 - y0) * 0.08 || 0.1;
   y0 -= pad; y1 += pad;
-  const pw = PLOT.w - PLOT.ml - PLOT.mr, ph = PLOT.h - PLOT.mt - PLOT.mb;
+  const pw = cfg.w - cfg.ml - cfg.mr, ph = cfg.h - cfg.mt - cfg.mb;
   return {
     t0, t1, y0, y1,
-    X: (t) => PLOT.ml + ((t - t0) / (t1 - t0 || 1)) * pw,
-    Y: (y) => PLOT.mt + ph - ((y - y0) / (y1 - y0 || 1)) * ph,
-    invX: (x) => t0 + ((x - PLOT.ml) / pw) * (t1 - t0),
+    X: (t) => cfg.ml + ((t - t0) / (t1 - t0 || 1)) * pw,
+    Y: (y) => cfg.mt + ph - ((y - y0) / (y1 - y0 || 1)) * ph,
+    invX: (x) => t0 + ((x - cfg.ml) / pw) * (t1 - t0),
   };
 }
 
@@ -159,7 +180,7 @@ function drawPlot() {
   svg.innerHTML = "";
   const pts = state.corrected || state.points;
   if (!pts.length) return;
-  const sc = scales(pts);
+  const sc = scales(pts, PLOT);
   state._sc = sc;
   const ph = PLOT.h - PLOT.mt - PLOT.mb;
 
@@ -482,6 +503,555 @@ window.restoreDs = async (id) => {
 };
 
 $("#btn-refresh-groups").addEventListener("click", loadGroups);
+
+// ------------------------------------------------------------ 批量分析
+
+const BPLOT = { w: 1040, h: 360, ml: 60, mr: 15, mt: 15, mb: 38 };
+const BRESID = { w: 1040, h: 130, ml: 60, mr: 15, mt: 10, mb: 25 };
+
+const batch = {
+  datasetId: null,
+  points: [],
+  corrected: null,   // 服务端返回的修正曲线
+  calib: [],         // [[t, expected], ...]
+  cycles: [],        // 服务端回显的周期（含结果/告警/裁决）
+  summary: null,
+  selected: null,    // 选中周期 id（查看残差）
+  calibMode: false,
+  addMode: false,
+  _sc: null,
+};
+
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (ch) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch]));
+
+const WARN_NAMES = {
+  CYCLE_OVERLAP: "周期重叠", CYCLE_TOO_SHORT: "测量段过短",
+  EVENT_IN_WINDOW: "跨事件", LOW_R2: "R²未达标", RATE_OUTLIER: "速率离群",
+  TOO_FEW_POINTS: "点数不足", TIME_REVERSED: "时间倒序", SIGN_FLIP: "符号反转",
+};
+
+function readSegParams() {
+  return {
+    method: $("#seg-method").value,
+    event_keyword: $("#seg-keyword").value.trim() || "flush",
+    rise_threshold: parseFloat($("#seg-rise").value) || 0.01,
+    rise_min_duration: parseFloat($("#seg-risedur").value) || 0,
+    flush_offset: parseFloat($("#seg-offset").value) || 0,
+    end_margin: parseFloat($("#seg-margin").value) || 0,
+    min_duration: parseFloat($("#seg-mindur").value) || 0,
+  };
+}
+
+function restoreBatchParams(p) {
+  const seg = p.seg || {};
+  $("#seg-method").value = seg.method || "event";
+  $("#seg-keyword").value = seg.event_keyword ?? "flush";
+  $("#seg-rise").value = seg.rise_threshold ?? 0.01;
+  $("#seg-risedur").value = seg.rise_min_duration ?? 0;
+  $("#seg-offset").value = seg.flush_offset ?? 60;
+  $("#seg-margin").value = seg.end_margin ?? 5;
+  $("#seg-mindur").value = p.min_duration ?? seg.min_duration ?? 60;
+  batch.calib = p.calib_points || [];
+  $("#batch-blank").value = p.blank_id || "";
+  $("#batch-r2").value = p.r2_threshold ?? 0.9;
+  $("#batch-minpts").value = p.min_points ?? 5;
+  toggleSegRows();
+}
+
+function toggleSegRows() {
+  const m = $("#seg-method").value;
+  $("#row-keyword").classList.toggle("seg-hidden", m !== "event");
+  $("#row-rise").classList.toggle("seg-hidden", m !== "rise");
+  $("#row-risedur").classList.toggle("seg-hidden", m !== "rise");
+}
+$("#seg-method").addEventListener("change", toggleSegRows);
+
+async function initBatchView() {
+  await loadDatasets();
+  toggleSegRows();
+  if (!batch.datasetId) {
+    const first = state.currentId || (state.datasets[0] && state.datasets[0].id);
+    if (first) {
+      $("#batch-dataset").value = first;
+      await batchSelect(first);
+    }
+  }
+}
+
+$("#batch-dataset").addEventListener("change", () => {
+  if ($("#batch-dataset").value) batchSelect(+$("#batch-dataset").value);
+});
+
+async function batchSelect(id) {
+  batch.datasetId = id;
+  batch.cycles = []; batch.corrected = null; batch.calib = [];
+  batch.summary = null; batch.selected = null;
+  $("#seg-msg").textContent = ""; $("#batch-save-msg").textContent = "";
+  const data = await api(`/api/dataset/${id}`);
+  batch.points = data.points;
+  renderBatchVersions(data.batch_versions || []);
+  updateBatchExportLinks();
+  if (data.batch_versions && data.batch_versions.length) {
+    // 恢复最近批次版本并重算（曲线/残差由重算刷新）
+    const full = await api(`/api/batch/version/${data.batch_versions[data.batch_versions.length - 1].id}`);
+    restoreBatchParams(full.version.params);
+    batch.cycles = full.version.cycles;
+    await runBatch(false, false);
+  } else {
+    drawBatchPlot(); drawBatchResid(); renderBatchTable(); renderBatchSummary();
+  }
+}
+
+function updateBatchExportLinks() {
+  const id = batch.datasetId;
+  $("#batch-exp-csv").href = `/api/batch/export/csv/${id}`;
+  $("#batch-exp-json").href = `/api/batch/export/json/${id}`;
+  $("#batch-exp-report").href = `/api/batch/report/${id}`;
+}
+
+// ---------------- 与服务端交互 ----------------
+
+async function runBatch(resegment, save) {
+  if (!batch.datasetId) { alert("请先选择数据集"); return null; }
+  const payload = {
+    dataset_id: batch.datasetId,
+    resegment: !!resegment,
+    seg: readSegParams(),
+    cycles: batch.cycles.map((c) => ({
+      start: c.start, end: c.end, locked: !!c.locked,
+      decision: c.decision || null, reason: c.reason || "",
+    })),
+    calib_points: batch.calib,
+    blank_id: $("#batch-blank").value || null,
+    r2_threshold: parseFloat($("#batch-r2").value) || 0.9,
+    min_points: parseInt($("#batch-minpts").value) || 5,
+    min_duration: parseFloat($("#seg-mindur").value) || 60,
+    save: !!save,
+    note: $("#batch-note").value,
+  };
+  try {
+    const data = await api("/api/batch/analyze", {
+      method: "POST", body: JSON.stringify(payload) });
+    batch.cycles = data.cycles;
+    batch.corrected = data.corrected;
+    batch.summary = data.summary;
+    renderBatchVersions(data.versions);
+    drawBatchPlot(); drawBatchResid(); renderBatchTable(); renderBatchSummary();
+    if (resegment) {
+      const msg = $("#seg-msg");
+      msg.className = "msg";
+      msg.textContent = data.n_candidates
+        ? `分段完成：候选 ${data.n_candidates} 个，合并后共 ${data.cycles.length} 个周期（锁定周期未受影响）`
+        : "按当前规则未找到候选周期，请调整分段方式或阈值";
+    }
+    if (save) {
+      const msg = $("#batch-save-msg");
+      msg.className = "msg";
+      msg.textContent = `已保存批次版本 v${data.version_id}（可撤销）`;
+      $("#batch-note").value = "";
+    }
+    return data;
+  } catch (e) {
+    alert("批量分析失败: " + e.message);
+    return null;
+  }
+}
+
+$("#btn-segment").addEventListener("click", () => runBatch(true, false));
+$("#btn-batch-recalc").addEventListener("click", () => runBatch(false, false));
+$("#btn-batch-save").addEventListener("click", () => runBatch(false, true));
+
+$("#btn-batch-undo").addEventListener("click", async () => {
+  if (!batch.datasetId) return;
+  const data = await api("/api/batch/undo", {
+    method: "POST", body: JSON.stringify({ dataset_id: batch.datasetId }) });
+  if (!data.ok) { alert(data.message); return; }
+  if (data.current) {
+    restoreBatchParams(data.current.params);
+    batch.cycles = data.current.cycles;
+    await runBatch(false, false);
+  } else {
+    batch.cycles = []; batch.corrected = null; batch.summary = null;
+    batch.selected = null;
+    renderBatchVersions(data.versions);
+    drawBatchPlot(); drawBatchResid(); renderBatchTable(); renderBatchSummary();
+  }
+  const msg = $("#batch-save-msg");
+  msg.className = "msg"; msg.textContent = data.message;
+});
+
+// ---------------- 总览图 ----------------
+
+function bSvgX(evt) {
+  const rect = $("#batch-plot").getBoundingClientRect();
+  return evt.clientX - rect.left;
+}
+
+function drawBatchPlot() {
+  const svg = $("#batch-plot");
+  svg.innerHTML = "";
+  const pts = batch.corrected || batch.points;
+  if (!pts.length) return;
+  const sc = scales(pts, BPLOT);
+  batch._sc = sc;
+  const ph = BPLOT.h - BPLOT.mt - BPLOT.mb;
+
+  // 周期色带（绿=计入汇总，红=未计入）
+  for (const c of batch.cycles) {
+    const x0 = sc.X(c.start), x1 = sc.X(c.end);
+    el("rect", { x: Math.min(x0, x1), y: BPLOT.mt,
+                 width: Math.abs(x1 - x0), height: ph,
+                 fill: c.included ? "#cfe8cf" : "#f2d7d7",
+                 opacity: batch.selected === c.id ? 0.9 : 0.5,
+                 stroke: c.locked ? "#1f3a5f" : "none",
+                 "stroke-width": c.locked ? 1.5 : 0,
+                 "data-band": c.id, cursor: "pointer" }, svg);
+    const lbl = el("text", { x: (x0 + x1) / 2, y: BPLOT.mt + 13, "font-size": 11,
+                             "text-anchor": "middle", fill: "#444",
+                             "pointer-events": "none" }, svg);
+    lbl.textContent = `#${c.id}${c.locked ? " 🔒" : ""}`;
+  }
+  // 事件竖线
+  for (const p of pts) {
+    if (!p.event) continue;
+    const x = sc.X(p.t);
+    el("line", { x1: x, y1: BPLOT.mt, x2: x, y2: BPLOT.mt + ph,
+                 stroke: "#d9534f", "stroke-dasharray": "4 3" }, svg);
+    const t = el("text", { x: x + 3, y: BPLOT.mt + 26, "font-size": 10,
+                           fill: "#d9534f" }, svg);
+    t.textContent = p.event;
+  }
+  // 原始曲线（有修正曲线时淡显）
+  if (batch.corrected) {
+    el("polyline", {
+      points: batch.points.map((p) => `${sc.X(p.t)},${sc.Y(p.o2)}`).join(" "),
+      fill: "none", stroke: "#bbb", "stroke-width": 1,
+      "stroke-dasharray": "3 2" }, svg);
+  }
+  // 主曲线
+  el("polyline", {
+    points: pts.map((p) =>
+      `${sc.X(p.t)},${sc.Y(p.o2_corr !== undefined ? p.o2_corr : p.o2)}`).join(" "),
+    fill: "none", stroke: "#2266aa", "stroke-width": 1.6 }, svg);
+  // 各周期拟合线
+  for (const c of batch.cycles) {
+    const r = c.result;
+    if (!r || r.slope == null) continue;
+    el("line", { x1: sc.X(c.start), y1: sc.Y(r.slope * c.start + r.intercept),
+                 x2: sc.X(c.end), y2: sc.Y(r.slope * c.end + r.intercept),
+                 stroke: "#cc3300", "stroke-width": 2,
+                 opacity: c.included ? 1 : 0.35,
+                 "pointer-events": "none" }, svg);
+  }
+  // 校准点
+  batch.calib.forEach(([ct, cv], i) => {
+    const c = el("circle", { cx: sc.X(ct), cy: sc.Y(cv), r: 5,
+                             fill: "#e8a13a", stroke: "#8a5a00",
+                             "stroke-width": 1.5, cursor: "pointer" }, svg);
+    const title = el("title", {}, c);
+    title.textContent = `校准点 ${i + 1}: t=${ct.toFixed(0)}s 期望=${cv.toFixed(3)}（点击删除）`;
+    c.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      batch.calib.splice(i, 1);
+      runBatch(false, false);
+    });
+  });
+  // 周期边界手柄（锁定周期不可拖动）
+  for (const c of batch.cycles) {
+    for (const [side, t] of [["start", c.start], ["end", c.end]]) {
+      const x = sc.X(t);
+      el("line", { x1: x, y1: BPLOT.mt, x2: x, y2: BPLOT.mt + ph,
+                   stroke: c.locked ? "#1f3a5f" : "#2a7a2a", "stroke-width": 1.5,
+                   "stroke-dasharray": c.locked ? "3 3" : "none",
+                   "pointer-events": "none" }, svg);
+      const grip = el("rect", { x: x - 4, y: BPLOT.mt, width: 8, height: ph,
+                                fill: "#000", opacity: 0,
+                                cursor: c.locked ? "default" : "ew-resize",
+                                "data-cid": c.id, "data-side": side }, svg);
+      const tip = el("title", {}, grip);
+      tip.textContent = c.locked ? "周期已锁定" : "拖动调整边界";
+    }
+  }
+  drawAxes(svg, sc, BPLOT);
+}
+
+function drawBatchResid() {
+  const svg = $("#batch-resid");
+  svg.innerHTML = "";
+  const c = batch.cycles.find((x) => x.id === batch.selected);
+  if (!c || !c.result || !c.result.residuals || !c.result.residuals.length) {
+    const t = el("text", { x: BRESID.ml, y: 32, "font-size": 11, fill: "#888" }, svg);
+    t.textContent = "点击总览图中的周期色带，查看该周期残差。";
+    return;
+  }
+  const ts = c.result.resid_t, rs = c.result.residuals;
+  const t0 = Math.min(...ts), t1 = Math.max(...ts);
+  const rmax = Math.max(...rs.map(Math.abs), 1e-9);
+  const pw = BRESID.w - BRESID.ml - BRESID.mr, ph = BRESID.h - BRESID.mt - BRESID.mb;
+  const X = (t) => BRESID.ml + ((t - t0) / (t1 - t0 || 1)) * pw;
+  const Y = (r) => BRESID.mt + ph / 2 - (r / rmax) * (ph / 2 - 4);
+  el("line", { x1: BRESID.ml, y1: Y(0), x2: BRESID.ml + pw, y2: Y(0),
+               stroke: "#999", "stroke-dasharray": "3 2" }, svg);
+  ts.forEach((t, i) => {
+    el("line", { x1: X(t), y1: Y(0), x2: X(t), y2: Y(rs[i]),
+                 stroke: "#cc3300", "stroke-width": 1 }, svg);
+    el("circle", { cx: X(t), cy: Y(rs[i]), r: 2.5, fill: "#cc3300" }, svg);
+  });
+  const lbl = el("text", { x: BRESID.ml, y: BRESID.h - 5, "font-size": 10,
+                           fill: "#666" }, svg);
+  lbl.textContent = `周期 #${c.id} 残差 (mg/L)，R²=${fmt(c.result.r2, 4)}，` +
+    `最大 |r| = ${rmax.toFixed(5)}`;
+}
+
+// ---------------- 总览图交互：拖边界 / 添加周期 / 校准点 ----------------
+
+let bDrag = null;   // {kind:"handle",cid,side} | {kind:"add",t0,t1}
+const bplot = $("#batch-plot");
+
+bplot.addEventListener("mousedown", (evt) => {
+  if (!batch.points.length || batch.calibMode) return;
+  const grip = evt.target.closest("[data-cid][data-side]");
+  if (grip) {
+    const c = batch.cycles.find((x) => x.id === +grip.dataset.cid);
+    if (c && !c.locked) {
+      bDrag = { kind: "handle", cid: c.id, side: grip.dataset.side };
+      evt.preventDefault();
+    }
+    return;
+  }
+  if (batch.addMode && batch._sc) {
+    bDrag = { kind: "add", t0: batch._sc.invX(bSvgX(evt)), t1: null };
+    evt.preventDefault();
+  }
+});
+
+bplot.addEventListener("mousemove", (evt) => {
+  if (!bDrag || !batch._sc) return;
+  const sc = batch._sc;
+  const t = Math.max(sc.t0, Math.min(sc.t1, sc.invX(bSvgX(evt))));
+  if (bDrag.kind === "handle") {
+    const c = batch.cycles.find((x) => x.id === bDrag.cid);
+    if (!c) return;
+    if (bDrag.side === "start") c.start = Math.min(t, c.end - 1);
+    else c.end = Math.max(t, c.start + 1);
+    drawBatchPlot();
+  } else {
+    bDrag.t1 = t;
+    drawBatchPlot();
+    // 拖动中画临时框
+    const x0 = sc.X(Math.min(bDrag.t0, t)), x1 = sc.X(Math.max(bDrag.t0, t));
+    el("rect", { x: x0, y: BPLOT.mt, width: x1 - x0,
+                 height: BPLOT.h - BPLOT.mt - BPLOT.mb,
+                 fill: "none", stroke: "#2a7a2a", "stroke-dasharray": "5 3" },
+       $("#batch-plot"));
+  }
+});
+
+window.addEventListener("mouseup", () => {
+  if (!bDrag) return;
+  const d = bDrag; bDrag = null;
+  if (d.kind === "handle") {
+    runBatch(false, false);
+  } else if (d.kind === "add") {
+    if (d.t1 != null && Math.abs(d.t1 - d.t0) > 2) {
+      batch.cycles.push({ start: Math.min(d.t0, d.t1), end: Math.max(d.t0, d.t1),
+                          locked: false, decision: null, reason: "" });
+      batch.addMode = false;
+      updateAddBtn();
+      runBatch(false, false);
+    } else {
+      drawBatchPlot();
+    }
+  }
+});
+
+bplot.addEventListener("click", (evt) => {
+  if (batch.calibMode) { batchAddCalib(evt); return; }
+  if (bDrag) return;
+  const band = evt.target.closest("[data-band]");
+  if (band) {
+    batch.selected = +band.dataset.band;
+    drawBatchPlot(); drawBatchResid(); renderBatchTable();
+  }
+});
+
+function batchAddCalib(evt) {
+  if (!batch._sc) return;
+  const t = batch._sc.invX(bSvgX(evt));
+  const pts = batch.points;
+  const nearest = pts.reduce((a, b) => Math.abs(b.t - t) < Math.abs(a.t - t) ? b : a);
+  const temp = nearest.temp != null ? nearest.temp : 25;
+  const press = nearest.press != null ? nearest.press : 101.325;
+  const cs = (14.652 - 0.41022 * temp + 0.007991 * temp ** 2 - 0.000077774 * temp ** 3)
+             * (press / 101.325);
+  const input = prompt(`校准点 t=${t.toFixed(0)}s 的期望氧浓度 (mg/L)`, cs.toFixed(3));
+  if (input === null) return;
+  const expected = parseFloat(input);
+  if (!isFinite(expected)) { alert("请输入数值"); return; }
+  batch.calib.push([nearest.t, expected]);
+  batch.calib.sort((a, b) => a[0] - b[0]);
+  runBatch(false, false);
+}
+
+function updateAddBtn() {
+  $("#btn-addcycle").classList.toggle("armed", batch.addMode);
+  $("#btn-addcycle").textContent = batch.addMode ? "在图上拖动框选新周期…" : "添加周期";
+}
+$("#btn-addcycle").addEventListener("click", () => {
+  batch.addMode = !batch.addMode;
+  updateAddBtn();
+});
+
+$("#btn-batch-calib").addEventListener("click", () => {
+  batch.calibMode = !batch.calibMode;
+  $("#btn-batch-calib").classList.toggle("armed", batch.calibMode);
+  $("#btn-batch-calib").textContent =
+    batch.calibMode ? "点击曲线放置校准点…" : "添加校准点";
+});
+$("#btn-batch-clear-calib").addEventListener("click", () => {
+  batch.calib = [];
+  runBatch(false, false);
+});
+
+// ---------------- 周期表格 / 汇总 / 版本 ----------------
+
+function cycleById(cid) {
+  return batch.cycles.find((c) => c.id === cid);
+}
+
+function renderBatchTable() {
+  const box = $("#batch-table");
+  if (!batch.cycles.length) {
+    box.innerHTML = '<p class="hint">尚未分段：设置分段规则后点“自动分段”，' +
+      "或用“添加周期”在图上手动框选。</p>";
+    return;
+  }
+  const r2th = parseFloat($("#batch-r2").value) || 0.9;
+  let html = `<table><thead><tr>
+<th>计入</th><th>#</th><th>起点 (s)</th><th>终点 (s)</th><th>时长 (s)</th>
+<th>点数</th><th>斜率 (mg/L/s)</th><th>R²</th><th>MO₂ (mg/h)</th><th>离群 z</th>
+<th>告警</th><th>锁定</th><th>裁决</th><th>理由</th><th></th></tr></thead><tbody>`;
+  for (const c of batch.cycles) {
+    const r = c.result || {};
+    const warns = (c.warnings || []).map((w) =>
+      `<span class="wtag" title="${esc(w.msg)}">${esc(WARN_NAMES[w.code] || w.code)}</span>`
+    ).join(" ");
+    const outlier = (c.warnings || []).some((w) => w.code === "RATE_OUTLIER");
+    html += `<tr data-cid="${c.id}" class="${c.included ? "" : "excluded"}${batch.selected === c.id ? " selected" : ""}">
+<td>${c.included ? "✔" : "—"}</td>
+<td>${c.id}${c.locked ? " 🔒" : ""}</td>
+<td>${c.start.toFixed(0)}</td><td>${c.end.toFixed(0)}</td>
+<td>${(c.end - c.start).toFixed(0)}</td>
+<td>${r.n ?? "—"}</td>
+<td>${fmt(r.slope, 8)}</td>
+<td class="${r.r2 != null && r.r2 < r2th ? "bad" : ""}">${fmt(r.r2, 4)}</td>
+<td><b>${fmt(r.mo2_net, 4)}</b></td>
+<td class="${outlier ? "outlier" : ""}">${c.outlier_z != null ? c.outlier_z.toFixed(2) : "—"}</td>
+<td class="warns">${warns || "—"}</td>
+<td><button class="btn-lock" data-cid="${c.id}" title="${c.locked ? "解锁" : "锁定（重新分段时保留边界）"}">${c.locked ? "🔓" : "🔒"}</button></td>
+<td><select class="sel-decision" data-cid="${c.id}">
+  <option value=""${!c.decision ? " selected" : ""}>自动</option>
+  <option value="keep"${c.decision === "keep" ? " selected" : ""}>保留</option>
+  <option value="exclude"${c.decision === "exclude" ? " selected" : ""}>剔除</option>
+</select></td>
+<td><span class="reason" data-cid="${c.id}" title="点击编辑理由">${esc(c.reason) || "…"}</span></td>
+<td><button class="btn-del" data-cid="${c.id}" title="删除该周期">✕</button></td>
+</tr>`;
+  }
+  html += "</tbody></table>";
+  box.innerHTML = html;
+
+  box.querySelectorAll(".btn-lock").forEach((b) => {
+    b.addEventListener("click", () => {
+      const c = cycleById(+b.dataset.cid);
+      if (c) { c.locked = !c.locked; drawBatchPlot(); renderBatchTable(); }
+    });
+  });
+  box.querySelectorAll(".sel-decision").forEach((s) => {
+    s.addEventListener("change", () => {
+      const c = cycleById(+s.dataset.cid);
+      if (!c) return;
+      if (s.value === "exclude") {
+        const reason = prompt("剔除理由（必填）：", c.reason || "");
+        if (!reason) { s.value = c.decision || ""; return; }
+        c.reason = reason;
+      } else if (s.value === "keep") {
+        const reason = prompt("保留理由（可选，离群周期建议填写）：", c.reason || "");
+        if (reason !== null && reason) c.reason = reason;
+      }
+      c.decision = s.value || null;
+      runBatch(false, false);
+    });
+  });
+  box.querySelectorAll(".reason").forEach((sp) => {
+    sp.addEventListener("click", () => {
+      const c = cycleById(+sp.dataset.cid);
+      if (!c) return;
+      const reason = prompt("保留/剔除理由：", c.reason || "");
+      if (reason === null) return;
+      c.reason = reason;
+      renderBatchTable();
+    });
+  });
+  box.querySelectorAll(".btn-del").forEach((b) => {
+    b.addEventListener("click", () => {
+      const c = cycleById(+b.dataset.cid);
+      if (!c || !confirm(`删除周期 #${c.id}（${c.start.toFixed(0)}–${c.end.toFixed(0)}s）？`)) return;
+      batch.cycles = batch.cycles.filter((x) => x.id !== c.id);
+      if (batch.selected === c.id) batch.selected = null;
+      runBatch(false, false);
+    });
+  });
+  box.querySelectorAll("tr[data-cid]").forEach((tr) => {
+    tr.addEventListener("click", (ev) => {
+      if (ev.target.closest("button,select,.reason")) return;
+      batch.selected = +tr.dataset.cid;
+      drawBatchPlot(); drawBatchResid(); renderBatchTable();
+    });
+  });
+}
+
+function renderBatchSummary() {
+  const box = $("#batch-summary");
+  const s = batch.summary;
+  if (!s || !batch.cycles.length) { box.innerHTML = ""; }
+  else {
+    box.innerHTML = `
+<div class="sum-card"><div class="sum-v">${s.n_included} / ${s.n_total}</div><div class="sum-k">有效 / 总周期</div></div>
+<div class="sum-card"><div class="sum-v">${fmt(s.mean, 4)}</div><div class="sum-k">均值 MO₂ (mg/h)</div></div>
+<div class="sum-card"><div class="sum-v">${fmt(s.std, 4)}</div><div class="sum-k">标准差</div></div>
+<div class="sum-card"><div class="sum-v">${s.cv == null ? "—" : s.cv.toFixed(1) + "%"}</div><div class="sum-k">变异系数</div></div>
+<div class="sum-card"><div class="sum-v">${fmt(s.median, 4)}</div><div class="sum-k">中位数</div></div>`;
+  }
+  // 告警计数
+  const chips = $("#batch-warnings");
+  chips.innerHTML = "";
+  const counts = {};
+  for (const c of batch.cycles)
+    for (const w of c.warnings || [])
+      counts[w.code] = (counts[w.code] || 0) + 1;
+  for (const [code, n] of Object.entries(counts)) {
+    const d = document.createElement("span");
+    d.className = "chip";
+    d.textContent = `${WARN_NAMES[code] || code} × ${n}`;
+    chips.appendChild(d);
+  }
+}
+
+function renderBatchVersions(versions) {
+  const ul = $("#batch-version-list");
+  ul.innerHTML = "";
+  (versions || []).forEach((v, i) => {
+    const li = document.createElement("li");
+    const time = new Date(v.created_at * 1000).toLocaleTimeString();
+    const s = v.summary || {};
+    li.innerHTML = `<b>v${i + 1}</b> ${time} ` +
+      `<span class="vnote">${esc(v.note || "")} 有效${s.n_included ?? "—"}/${s.n_total ?? "—"}周期 ` +
+      `均值=${fmt(s.mean, 4)}</span>`;
+    ul.appendChild(li);
+  });
+}
 
 // ------------------------------------------------------------ 启动
 

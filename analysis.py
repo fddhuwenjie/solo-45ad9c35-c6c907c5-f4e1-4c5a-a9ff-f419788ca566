@@ -276,11 +276,12 @@ def _o2_of(p):
     return p.get("o2_corr", p["o2"])
 
 
-def _rise_bounds(points, threshold, min_duration):
-    """氧浓度回升（冲洗）区段的末端时刻列表。
+def _rise_regions(points, threshold, min_duration):
+    """氧浓度回升（冲洗）区段列表 [(start_t, end_t), ...]。
 
     相邻点升高速率超过 threshold (mg/L/s) 视为上升；连续上升区段
     持续时间短于 min_duration (s) 的视为噪声忽略。
+    start_t 为回升前最后一个测量点时刻，end_t 为回升区段末端时刻。
     """
     pts = sorted(points, key=lambda p: p["t"])
     n = len(pts)
@@ -289,7 +290,7 @@ def _rise_bounds(points, threshold, min_duration):
         dt = pts[i + 1]["t"] - pts[i]["t"]
         rising.append(dt > 0 and
                       (_o2_of(pts[i + 1]) - _o2_of(pts[i])) / dt > threshold)
-    bounds = []
+    regions = []
     i = 0
     while i < n - 1:
         if not rising[i]:
@@ -299,9 +300,9 @@ def _rise_bounds(points, threshold, min_duration):
         while j + 1 < n - 1 and rising[j + 1]:
             j += 1
         if pts[j + 1]["t"] - pts[i]["t"] >= min_duration:
-            bounds.append(pts[j + 1]["t"])
+            regions.append((pts[i]["t"], pts[j + 1]["t"]))
         i = j + 1
-    return bounds
+    return regions
 
 
 def segment(points, seg):
@@ -312,9 +313,12 @@ def segment(points, seg):
       event_keyword     事件关键字（默认 flush，不区分大小写）
       rise_threshold    回升速率阈值 mg/L/s（method=rise）
       rise_min_duration 回升区段最短持续 s（method=rise）
-      flush_offset      边界后跳过 s（冲洗/换水平稳时间）
-      end_margin        下一边界前预留 s
+      flush_offset      冲洗结束后跳过 s（换水平稳时间）
+      end_margin        下次冲洗开始前预留 s
       min_duration      首末段短于该值则舍弃（记录可能未覆盖完整周期）
+
+    冲洗区段（回升段）与封闭测量窗严格分离：测量窗终点为下次冲洗
+    开始前 end_margin，起点为上次冲洗结束后 flush_offset。
     """
     if not points:
         return []
@@ -324,24 +328,31 @@ def segment(points, seg):
     ts = [p["t"] for p in points]
     t0, t1 = min(ts), max(ts)
     if seg.get("method") == "rise":
-        bounds = _rise_bounds(points,
-                              float(seg.get("rise_threshold", 0.01)),
-                              float(seg.get("rise_min_duration", 0.0)))
+        regions = _rise_regions(points,
+                                float(seg.get("rise_threshold", 0.01)),
+                                float(seg.get("rise_min_duration", 0.0)))
     else:
         kw = (seg.get("event_keyword") or "flush").strip().lower()
-        bounds = sorted(p["t"] for p in points
-                        if p.get("event") and kw in p["event"].lower())
-    bounds = [b for b in bounds if t0 < b < t1]
-    if not bounds:
+        regions = [(p["t"], p["t"]) for p in points
+                   if p.get("event") and kw in p["event"].lower()]
+        regions.sort()
+    # 裁剪到数据范围内：(冲洗开始, 冲洗结束)。数据末点本身若是冲洗
+    # 边界（常见于记录恰好结束于一次冲洗），保留以便末段周期在其前
+    # end_margin 处收尾，避免把冲洗点并入测量窗。
+    regions = [(max(a, t0), min(b, t1)) for a, b in regions
+               if b >= t0 and a <= t1]
+    if not regions:
         return []
-    starts = [t0] + bounds
+    starts = [t0] + [b for _, b in regions]
+    ends = [a for a, _ in regions] + [t1]
+    n = len(starts)
     out = []
-    for i, s in enumerate(starts):
-        a = s + offset
-        e = (bounds[i] - margin) if i < len(bounds) else t1
+    for i in range(n):
+        a = starts[i] + offset
+        e = ends[i] - margin if i < n - 1 else ends[i]
         if e <= a:
             continue
-        if i in (0, len(starts) - 1) and (e - a) < min_dur:
+        if i in (0, n - 1) and (e - a) < min_dur:
             continue
         out.append({"start": a, "end": e})
     return out
