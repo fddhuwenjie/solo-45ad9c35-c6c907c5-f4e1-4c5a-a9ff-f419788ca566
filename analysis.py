@@ -165,11 +165,12 @@ def linregress(xs, ys):
 
 
 def analyze_window(corrected, window, blank_rate=None, blank_volume=None,
-                   r2_threshold=0.9, min_points=5):
+                   r2_threshold=0.9, min_points=5, blank_source=None):
     """在已修正曲线上分析一个测量窗口，返回结果字典（含 warnings 列表）。
 
     window: (t0, t1)；blank_rate: 空白室耗氧率 mg/h（已换算）；
-    blank_volume: 空白室体积 L。
+    blank_volume: 空白室体积 L；
+    blank_source: 时变空白来源信息（mode/anchors/gap_s），并入结果 blank 字段。
     """
     warnings = []
 
@@ -234,6 +235,8 @@ def analyze_window(corrected, window, blank_rate=None, blank_volume=None,
         bv = blank_volume or volume
         scaled = blank_rate * (volume / bv) if bv else blank_rate
         blank_used = {"rate": blank_rate, "volume": bv, "scaled": scaled}
+        if blank_source:
+            blank_used.update(blank_source)
         mo2_net = mo2_raw - scaled
         if mo2_raw != 0 and (mo2_net < 0) != (mo2_raw < 0):
             warnings.append({
@@ -242,6 +245,8 @@ def analyze_window(corrected, window, blank_rate=None, blank_volume=None,
                         f"修正后 {mo2_net:.4f} mg/h），"
                         "空白速率可能过大或信号过弱"),
             })
+    elif blank_source:
+        blank_used = dict(blank_source)
 
     result.update({
         "slope": slope, "intercept": intercept, "r2": r2,
@@ -268,6 +273,101 @@ def analyze(points, window, calib_points=None, blank_rate=None,
     result["corrected"] = corrected
     result["calib_points"] = calib_points
     return result
+
+
+# ---------------------------------------------------------------- 时变空白校正
+
+def _interp_vol(left, right, w):
+    lv, rv = left.get("volume"), right.get("volume")
+    if lv is None:
+        return rv
+    if rv is None:
+        return lv
+    return lv + w * (rv - lv)
+
+
+def make_blank_resolver(anchors, method="linear", max_gap_s=None):
+    """构造时变空白解析器：在样本测量窗时间轴上对齐背景序列锚点。
+
+    anchors: [{"id", "t", "rate", "volume", "rev", "locked"}, ...]
+      （t 为采集时刻，与样本时间轴一致；rate 为 None 的锚点被忽略）。
+    method: "linear"（线性插值）或 "nearest"（最近锚点）。
+    max_gap_s: 锚点间隔阈值，超过则给出 BLANK_GAP_TOO_LARGE 告警。
+
+    返回 f(t) -> (rate, volume, source, warnings)：
+      source = {"mode": linear|nearest|single|none,
+                "anchors": [{id, t, rate, rev, locked, weight}], "gap_s": ...}
+    区间外推按最近两锚点线性外推（负值截断为 0），并给出 BLANK_EXTRAPOLATE。
+    """
+    usable = sorted((a for a in anchors if a.get("rate") is not None),
+                    key=lambda a: a["t"])
+
+    def _src(mode, used, gap=None):
+        return {"mode": mode, "gap_s": gap,
+                "anchors": [{"id": a["id"], "t": a["t"], "rate": a["rate"],
+                             "rev": a.get("rev"),
+                             "locked": bool(a.get("locked")), "weight": w}
+                            for a, w in used]}
+
+    def resolve(t):
+        if not usable:
+            return None, None, _src("none", []), [{
+                "code": "BLANK_NO_ANCHOR",
+                "msg": "背景序列无可用锚点（均停用或缺少已确认批量均值），"
+                       "未做空白修正"}]
+        if len(usable) == 1:
+            a = usable[0]
+            warns = []
+            if method == "linear":
+                warns.append({
+                    "code": "BLANK_NO_BRACKET",
+                    "msg": f"缺少前后锚点（仅锚点 A{a['id']} 可用），"
+                           "采用该锚点速率"})
+            return a["rate"], a.get("volume"), _src("single", [(a, 1.0)]), warns
+        if method == "nearest":
+            a = min(usable, key=lambda x: (abs(x["t"] - t), x["t"]))
+            dist = abs(a["t"] - t)
+            warns = []
+            if max_gap_s and dist > max_gap_s:
+                warns.append({
+                    "code": "BLANK_GAP_TOO_LARGE",
+                    "msg": f"最近锚点 A{a['id']} 距测量窗 {dist:.0f}s，"
+                           f"超过阈值 {max_gap_s:.0f}s"})
+            return (a["rate"], a.get("volume"),
+                    _src("nearest", [(a, 1.0)], dist), warns)
+        # 线性插值 / 区间外推
+        if t <= usable[0]["t"]:
+            left, right = usable[0], usable[1]
+            outside = t < usable[0]["t"]
+        elif t >= usable[-1]["t"]:
+            left, right = usable[-2], usable[-1]
+            outside = t > usable[-1]["t"]
+        else:
+            left, right, outside = usable[0], usable[1], False
+            for i in range(len(usable) - 1):
+                if usable[i]["t"] <= t <= usable[i + 1]["t"]:
+                    left, right = usable[i], usable[i + 1]
+                    break
+        span = right["t"] - left["t"]
+        w = (t - left["t"]) / span if span > 0 else 0.0
+        rate = left["rate"] + w * (right["rate"] - left["rate"])
+        warns = []
+        if outside:
+            msg = (f"测量窗超出锚点区间，按最近两锚点 "
+                   f"A{left['id']}~A{right['id']} 线性外推")
+            if rate < 0:
+                rate = 0.0
+                msg += "；外推速率为负，已截断为 0"
+            warns.append({"code": "BLANK_EXTRAPOLATE", "msg": msg})
+        if max_gap_s and span > max_gap_s:
+            warns.append({
+                "code": "BLANK_GAP_TOO_LARGE",
+                "msg": f"锚点 A{left['id']}~A{right['id']} 间隔 {span:.0f}s "
+                       f"超过阈值 {max_gap_s:.0f}s，插值可靠性低"})
+        return (rate, _interp_vol(left, right, w),
+                _src("linear", [(left, 1.0 - w), (right, w)], span), warns)
+
+    return resolve
 
 
 # ---------------------------------------------------------------- 自动分段
@@ -380,7 +480,9 @@ def merge_locked_cycles(existing, candidates):
 # 出现任一即判定周期“自动无效”的告警（用户可裁决保留）
 BLOCKING_CODES = ("CYCLE_OVERLAP", "CYCLE_TOO_SHORT", "TOO_FEW_POINTS",
                   "LOW_R2", "EVENT_IN_WINDOW", "TIME_REVERSED", "SIGN_FLIP",
-                  "RATE_OUTLIER")
+                  "RATE_OUTLIER",
+                  "BLANK_NO_ANCHOR", "BLANK_NO_BRACKET",
+                  "BLANK_GAP_TOO_LARGE", "BLANK_EXTRAPOLATE")
 
 
 def _median(xs):
@@ -394,11 +496,13 @@ def _median(xs):
 
 def analyze_cycles(corrected, cycles, blank_rate=None, blank_volume=None,
                    r2_threshold=0.9, min_points=5, min_duration=60.0,
-                   mad_threshold=3.5):
+                   mad_threshold=3.5, blank_resolver=None):
     """批量分析一组周期边界。
 
     cycles: [{start, end, locked, decision, reason}, ...]
       decision: None=自动 / "keep"=保留 / "exclude"=剔除（reason 为理由）。
+    blank_resolver: 时变空白解析器 f(t) -> (rate, volume, source, warnings)，
+      在每个周期测量窗中点取值；提供时忽略 blank_rate/blank_volume。
     返回 {"cycles": [...含结果与告警...], "summary": {...}}。
     """
     cycles = sorted(cycles,
@@ -412,10 +516,14 @@ def analyze_cycles(corrected, cycles, blank_rate=None, blank_volume=None,
     out = []
     for i, c in enumerate(cycles):
         start, end = float(c["start"]), float(c["end"])
-        res = analyze_window(corrected, (start, end), blank_rate=blank_rate,
-                             blank_volume=blank_volume,
-                             r2_threshold=r2_threshold, min_points=min_points)
-        warnings = list(res["warnings"])
+        if blank_resolver is not None:
+            b_rate, b_vol, b_src, b_warns = blank_resolver((start + end) / 2.0)
+        else:
+            b_rate, b_vol, b_src, b_warns = blank_rate, blank_volume, None, []
+        res = analyze_window(corrected, (start, end), blank_rate=b_rate,
+                             blank_volume=b_vol, r2_threshold=r2_threshold,
+                             min_points=min_points, blank_source=b_src)
+        warnings = list(res["warnings"]) + list(b_warns)
         if overlap[i]:
             warnings.append({"code": "CYCLE_OVERLAP",
                              "msg": "与相邻周期时间重叠，请拖动边界消除"})

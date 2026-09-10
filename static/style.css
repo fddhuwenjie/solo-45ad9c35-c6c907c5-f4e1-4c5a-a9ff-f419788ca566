@@ -121,3 +121,24 @@ button.armed { background: #b3540e; color: #fff; border-color: #b3540e; }
 .batch-table .reason { color: #1f3a5f; cursor: text; text-decoration: underline dotted; }
 .btn-lock, .btn-del { padding: 1px 6px; font-size: 12px; }
 .sel-decision { font-size: 12px; }
+.batch-table td.src { max-width: 130px; white-space: normal; font-size: 11px; }
+
+/* ---------------- 空白序列（时变空白校正） ---------------- */
+#series-sidebar { width: 300px; flex-shrink: 0; display: flex; flex-direction: column; gap: 12px; }
+#series-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 12px; }
+#blank-strip { display: block; margin-top: 6px; border-top: 1px dashed #ccc; }
+#blank-strip.hidden { display: none; }
+
+.anchor-table { overflow-x: auto; }
+.anchor-table table { border-collapse: collapse; width: 100%; font-size: 12px; }
+.anchor-table th, .anchor-table td { border: 1px solid #ccc; padding: 3px 6px; white-space: nowrap; }
+.anchor-table th { background: #eef2f7; }
+.anchor-table input[type=number] { width: 90px; }
+.anchor-table input[type=text] { width: 110px; }
+.anchor-table select { max-width: 150px; }
+.anchor-table tr.anchor-off td { color: #999; background: #fafafa; }
+.anchor-table .a-rate { font-weight: 600; color: #8a4b08; }
+.anchor-table .a-rate.missing { color: #b3271e; font-weight: 400; }
+#series-plot { display: block; background: #fff; }
+#series-affected ul { margin: 6px 0 0; padding-left: 18px; }
+#series-affected li { margin: 3px 0; }

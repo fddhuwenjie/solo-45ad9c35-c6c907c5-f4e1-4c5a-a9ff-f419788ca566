@@ -1,4 +1,4 @@
-"""sqlite3 存储：数据集、数据点、分析版本、剔除记录、批次版本。"""
+"""sqlite3 存储：数据集、数据点、分析版本、剔除记录、批次版本、背景序列。"""
 
 from __future__ import annotations
 
@@ -53,6 +53,29 @@ CREATE TABLE IF NOT EXISTS batch_versions (
     summary_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_batch_versions_ds ON batch_versions(dataset_id, id);
+CREATE TABLE IF NOT EXISTS blank_series (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL DEFAULT '背景序列',
+    method TEXT NOT NULL DEFAULT 'linear',
+    max_gap_s REAL NOT NULL DEFAULT 7200,
+    rev INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS blank_anchors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    series_id INTEGER NOT NULL,
+    blank_dataset_id INTEGER NOT NULL,
+    collected_at REAL NOT NULL,
+    disabled INTEGER NOT NULL DEFAULT 0,
+    locked_rate REAL,
+    note TEXT DEFAULT '',
+    rev INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_anchors_series
+    ON blank_anchors(series_id, collected_at);
 """
 
 
@@ -100,6 +123,7 @@ def get_points(conn, ds_id):
 def delete_dataset(conn, ds_id):
     for tbl in ("points", "versions", "exclusions", "batch_versions"):
         conn.execute(f"DELETE FROM {tbl} WHERE dataset_id=?", (ds_id,))
+    conn.execute("DELETE FROM blank_anchors WHERE blank_dataset_id=?", (ds_id,))
     conn.execute("DELETE FROM datasets WHERE id=?", (ds_id,))
     conn.commit()
 
@@ -206,6 +230,100 @@ def undo_batch_version(conn, ds_id):
         "params": json.loads(cur["params_json"]),
         "cycles": json.loads(cur["cycles_json"]),
         "summary": json.loads(cur["summary_json"])}
+
+
+# ------------------------------------------------------------------ 背景序列
+
+def create_series(conn, name, method="linear", max_gap_s=7200):
+    now = time.time()
+    cur = conn.execute(
+        "INSERT INTO blank_series(name, method, max_gap_s, rev, created_at,"
+        " updated_at) VALUES (?,?,?,1,?,?)",
+        (name, method, max_gap_s, now, now))
+    conn.commit()
+    return cur.lastrowid
+
+
+def update_series_settings(conn, series_id, name, method, max_gap_s):
+    conn.execute(
+        "UPDATE blank_series SET name=?, method=?, max_gap_s=?, updated_at=?"
+        " WHERE id=?", (name, method, max_gap_s, time.time(), series_id))
+    conn.commit()
+
+
+def bump_series_rev(conn, series_id):
+    """任何锚点/设置变化使序列 rev+1（锚点版本机制），返回新 rev。"""
+    conn.execute(
+        "UPDATE blank_series SET rev=rev+1, updated_at=? WHERE id=?",
+        (time.time(), series_id))
+    conn.commit()
+    row = conn.execute("SELECT rev FROM blank_series WHERE id=?",
+                       (series_id,)).fetchone()
+    return row["rev"] if row else None
+
+
+def _anchors_of(conn, series_id):
+    rows = conn.execute(
+        "SELECT * FROM blank_anchors WHERE series_id=?"
+        " ORDER BY collected_at, id", (series_id,)).fetchall()
+    return [{"id": r["id"], "series_id": r["series_id"],
+             "blank_dataset_id": r["blank_dataset_id"],
+             "collected_at": r["collected_at"],
+             "disabled": bool(r["disabled"]),
+             "locked_rate": r["locked_rate"],
+             "note": r["note"], "rev": r["rev"],
+             "created_at": r["created_at"], "updated_at": r["updated_at"]}
+            for r in rows]
+
+
+def _series_row(r, anchors):
+    return {"id": r["id"], "name": r["name"], "method": r["method"],
+            "max_gap_s": r["max_gap_s"], "rev": r["rev"],
+            "created_at": r["created_at"], "updated_at": r["updated_at"],
+            "anchors": anchors}
+
+
+def get_series(conn, series_id):
+    r = conn.execute("SELECT * FROM blank_series WHERE id=?",
+                     (series_id,)).fetchone()
+    if not r:
+        return None
+    return _series_row(r, _anchors_of(conn, series_id))
+
+
+def list_series(conn):
+    rows = conn.execute("SELECT * FROM blank_series ORDER BY id").fetchall()
+    return [_series_row(r, _anchors_of(conn, r["id"])) for r in rows]
+
+
+def add_anchor(conn, series_id, blank_dataset_id, collected_at,
+               disabled=False, locked_rate=None, note=""):
+    now = time.time()
+    cur = conn.execute(
+        "INSERT INTO blank_anchors(series_id, blank_dataset_id, collected_at,"
+        " disabled, locked_rate, note, rev, created_at, updated_at)"
+        " VALUES (?,?,?,?,?,?,1,?,?)",
+        (series_id, blank_dataset_id, collected_at, 1 if disabled else 0,
+         locked_rate, note, now, now))
+    conn.commit()
+    return cur.lastrowid
+
+
+def update_anchor(conn, anchor_id, blank_dataset_id, collected_at, disabled,
+                  locked_rate, note):
+    """更新锚点并使其 rev+1。"""
+    conn.execute(
+        "UPDATE blank_anchors SET blank_dataset_id=?, collected_at=?,"
+        " disabled=?, locked_rate=?, note=?, rev=rev+1, updated_at=?"
+        " WHERE id=?",
+        (blank_dataset_id, collected_at, 1 if disabled else 0, locked_rate,
+         note, time.time(), anchor_id))
+    conn.commit()
+
+
+def delete_anchor(conn, anchor_id):
+    conn.execute("DELETE FROM blank_anchors WHERE id=?", (anchor_id,))
+    conn.commit()
 
 
 # ------------------------------------------------------------------ 剔除

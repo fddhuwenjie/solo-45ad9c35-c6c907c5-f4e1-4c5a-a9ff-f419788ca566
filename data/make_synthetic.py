@@ -123,6 +123,15 @@ def blank_chamber():
     write_csv("blank_chamber.csv", rows)
 
 
+def blank_chamber_late():
+    """第二份空白室（较晚时段采集）：微生物耗氧速率略高，
+    与 blank_chamber.csv 组成背景序列，演示时变空白插值。"""
+    rows = make_rows(0.045, 0.95, 22.2, 101.2, drift_linear)
+    for r in rows:
+        r[0] += 3600                       # 时间轴平移到 3600–5400s
+    write_csv("blank_chamber_late.csv", rows)
+
+
 def fish_c_run1():
     """样本C：5 个周期，第 4 周期耗氧率异常偏高（MAD 离群演示）。"""
     rates = [0.35, 0.36, 0.34, 0.95, 0.35]
@@ -151,3 +160,4 @@ if __name__ == "__main__":
     fish_b_run1()
     blank_chamber()
     fish_c_run1()
+    blank_chamber_late()

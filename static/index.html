@@ -12,6 +12,7 @@
   <nav>
     <button class="tab active" data-view="analyze">曲线分析</button>
     <button class="tab" data-view="batch">批量分析</button>
+    <button class="tab" data-view="series">空白序列</button>
     <button class="tab" data-view="groups">分组比较</button>
   </nav>
 </header>
@@ -115,8 +116,11 @@
 
     <section class="panel">
       <h2>分析参数</h2>
-      <label>空白室
+      <label>空白室（静态）
         <select id="batch-blank"><option value="">（不使用）</option></select>
+      </label>
+      <label>背景序列（时变空白，优先）
+        <select id="batch-series"><option value="">（不使用）</option></select>
       </label>
       <label>R² 阈值 <input id="batch-r2" type="number" step="0.01" value="0.90"></label>
       <label>最少点数 <input id="batch-minpts" type="number" step="1" value="5"></label>
@@ -153,10 +157,57 @@
     <div id="batch-plot-wrap">
       <svg id="batch-plot" width="1040" height="360"></svg>
       <svg id="batch-resid" width="1040" height="130"></svg>
+      <svg id="blank-strip" width="1040" height="90" class="hidden"></svg>
     </div>
     <div id="batch-summary" class="batch-summary"></div>
     <div id="batch-warnings" class="batch-chips"></div>
     <div id="batch-table" class="batch-table"></div>
+  </section>
+</main>
+
+<!-- ==================== 空白序列视图（时变空白校正） ==================== -->
+<main id="view-series" class="view hidden">
+  <aside id="series-sidebar">
+    <section class="panel">
+      <h2>背景序列</h2>
+      <select id="series-select"></select>
+      <div class="btn-row">
+        <button id="btn-series-new">新建序列</button>
+      </div>
+      <label>名称 <input id="series-name" value="背景序列"></label>
+      <label>校正方式
+        <select id="series-method">
+          <option value="linear">线性插值</option>
+          <option value="nearest">最近锚点</option>
+        </select></label>
+      <label>锚点间隔阈值 (s)
+        <input id="series-maxgap" type="number" step="60" min="0" value="7200"></label>
+      <div class="btn-row">
+        <button id="btn-series-save" class="primary">保存序列</button>
+      </div>
+      <div id="series-msg" class="msg"></div>
+      <p class="hint">每个锚点对应一份空白室数据，速率自动取其<b>最近已确认批次版本</b>的有效周期均值；填“锁定值”可改为人工指定。采集时刻需与样本时间轴一致（样本用 Unix 秒则填 Unix 秒）。</p>
+    </section>
+
+    <section class="panel">
+      <h2>受影响样本</h2>
+      <div id="series-affected" class="hint">保存序列后，引用本序列且结果发生变化的样本会自动生成关联新版本（旧版本仍可查阅）。</div>
+    </section>
+  </aside>
+
+  <section id="series-main">
+    <div class="panel">
+      <h2>锚点（背景序列）</h2>
+      <div id="anchor-table" class="anchor-table"></div>
+      <div class="btn-row">
+        <button id="btn-anchor-add">添加锚点</button>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>背景模型预览</h2>
+      <svg id="series-plot" width="1040" height="240"></svg>
+      <p class="hint">菱形=启用锚点（深色为人工锁定），灰叉=停用或无速率锚点；虚线为校正模型（线性插值或最近锚点阶梯）。</p>
+    </div>
   </section>
 </main>
 

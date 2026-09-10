@@ -13,6 +13,8 @@ const state = {
   calibPoints: [],     // [[t, expected], ...]
   calibMode: false,
   lastResult: null,
+  seriesList: [],      // 背景序列（时变空白）
+  blankRates: {},      // 空白数据集 id -> {rate, volume, version_id}
 };
 
 // ------------------------------------------------------------ 通用
@@ -38,6 +40,7 @@ document.querySelectorAll(".tab").forEach((btn) => {
     $("#view-" + btn.dataset.view).classList.remove("hidden");
     if (btn.dataset.view === "groups") loadGroups();
     if (btn.dataset.view === "batch") initBatchView();
+    if (btn.dataset.view === "series") initSeriesView();
   });
 });
 
@@ -70,6 +73,14 @@ $("#btn-upload").addEventListener("click", async () => {
 async function loadDatasets() {
   const data = await api("/api/datasets");
   state.datasets = data.datasets;
+  try {
+    const sdata = await api("/api/series");
+    state.seriesList = sdata.series || [];
+    state.blankRates = sdata.blank_rates || {};
+  } catch (e) {
+    state.seriesList = [];
+    state.blankRates = {};
+  }
   const ul = $("#dataset-list");
   ul.innerHTML = "";
   for (const d of data.datasets) {
@@ -111,6 +122,18 @@ async function loadDatasets() {
     bb.appendChild(op);
   }
   bb.value = prevBB;
+  // 批量分析视图：背景序列下拉
+  const bs = $("#batch-series");
+  const prevS = bs.value;
+  bs.innerHTML = '<option value="">（不使用）</option>';
+  for (const s of state.seriesList) {
+    const op = document.createElement("option");
+    op.value = s.id;
+    op.textContent = `${s.name}（${s.method === "linear" ? "线性插值" : "最近锚点"} rev${s.rev}）`;
+    bs.appendChild(op);
+  }
+  bs.value = prevS;
+  toggleBlankSelects();
 }
 
 async function selectDataset(id) {
@@ -516,6 +539,7 @@ const batch = {
   calib: [],         // [[t, expected], ...]
   cycles: [],        // 服务端回显的周期（含结果/告警/裁决）
   summary: null,
+  seriesInfo: null,  // 时变空白序列信息（锚点/方法/版本）
   selected: null,    // 选中周期 id（查看残差）
   calibMode: false,
   addMode: false,
@@ -529,6 +553,8 @@ const WARN_NAMES = {
   CYCLE_OVERLAP: "周期重叠", CYCLE_TOO_SHORT: "测量段过短",
   EVENT_IN_WINDOW: "跨事件", LOW_R2: "R²未达标", RATE_OUTLIER: "速率离群",
   TOO_FEW_POINTS: "点数不足", TIME_REVERSED: "时间倒序", SIGN_FLIP: "符号反转",
+  BLANK_NO_ANCHOR: "无可用锚点", BLANK_NO_BRACKET: "缺少前后锚点",
+  BLANK_GAP_TOO_LARGE: "锚点间隔超限", BLANK_EXTRAPOLATE: "区间外推",
 };
 
 function readSegParams() {
@@ -554,10 +580,18 @@ function restoreBatchParams(p) {
   $("#seg-mindur").value = p.min_duration ?? seg.min_duration ?? 60;
   batch.calib = p.calib_points || [];
   $("#batch-blank").value = p.blank_id || "";
+  $("#batch-series").value = p.blank_series_id || "";
   $("#batch-r2").value = p.r2_threshold ?? 0.9;
   $("#batch-minpts").value = p.min_points ?? 5;
   toggleSegRows();
+  toggleBlankSelects();
 }
+
+function toggleBlankSelects() {
+  // 选择背景序列时静态空白室不生效（服务端以序列优先）
+  $("#batch-blank").disabled = !!$("#batch-series").value;
+}
+$("#batch-series").addEventListener("change", toggleBlankSelects);
 
 function toggleSegRows() {
   const m = $("#seg-method").value;
@@ -586,7 +620,7 @@ $("#batch-dataset").addEventListener("change", () => {
 async function batchSelect(id) {
   batch.datasetId = id;
   batch.cycles = []; batch.corrected = null; batch.calib = [];
-  batch.summary = null; batch.selected = null;
+  batch.summary = null; batch.selected = null; batch.seriesInfo = null;
   $("#seg-msg").textContent = ""; $("#batch-save-msg").textContent = "";
   const data = await api(`/api/dataset/${id}`);
   batch.points = data.points;
@@ -599,7 +633,8 @@ async function batchSelect(id) {
     batch.cycles = full.version.cycles;
     await runBatch(false, false);
   } else {
-    drawBatchPlot(); drawBatchResid(); renderBatchTable(); renderBatchSummary();
+    drawBatchPlot(); drawBatchResid(); drawBlankStrip();
+    renderBatchTable(); renderBatchSummary();
   }
 }
 
@@ -624,6 +659,7 @@ async function runBatch(resegment, save) {
     })),
     calib_points: batch.calib,
     blank_id: $("#batch-blank").value || null,
+    blank_series_id: $("#batch-series").value || null,
     r2_threshold: parseFloat($("#batch-r2").value) || 0.9,
     min_points: parseInt($("#batch-minpts").value) || 5,
     min_duration: parseFloat($("#seg-mindur").value) || 60,
@@ -636,8 +672,10 @@ async function runBatch(resegment, save) {
     batch.cycles = data.cycles;
     batch.corrected = data.corrected;
     batch.summary = data.summary;
+    batch.seriesInfo = data.blank_series || null;
     renderBatchVersions(data.versions);
-    drawBatchPlot(); drawBatchResid(); renderBatchTable(); renderBatchSummary();
+    drawBatchPlot(); drawBatchResid(); drawBlankStrip();
+    renderBatchTable(); renderBatchSummary();
     if (resegment) {
       const msg = $("#seg-msg");
       msg.className = "msg";
@@ -673,9 +711,10 @@ $("#btn-batch-undo").addEventListener("click", async () => {
     await runBatch(false, false);
   } else {
     batch.cycles = []; batch.corrected = null; batch.summary = null;
-    batch.selected = null;
+    batch.selected = null; batch.seriesInfo = null;
     renderBatchVersions(data.versions);
-    drawBatchPlot(); drawBatchResid(); renderBatchTable(); renderBatchSummary();
+    drawBatchPlot(); drawBatchResid(); drawBlankStrip();
+    renderBatchTable(); renderBatchSummary();
   }
   const msg = $("#batch-save-msg");
   msg.className = "msg"; msg.textContent = data.message;
@@ -804,6 +843,90 @@ function drawBatchResid() {
     `最大 |r| = ${rmax.toFixed(5)}`;
 }
 
+// 时变空白：背景模型与样本测量窗在时间轴上对齐的预览条
+function drawBlankStrip() {
+  const svg = $("#blank-strip");
+  svg.innerHTML = "";
+  const info = batch.seriesInfo, sc = batch._sc;
+  if (!info || !sc || !info.anchors) { svg.classList.add("hidden"); return; }
+  svg.classList.remove("hidden");
+  const cfg = { w: BPLOT.w, h: 90, ml: BPLOT.ml, mr: BPLOT.mr, mt: 16, mb: 20 };
+  const pw = cfg.w - cfg.ml - cfg.mr, ph = cfg.h - cfg.mt - cfg.mb;
+  const X = (t) => cfg.ml + ((t - sc.t0) / (sc.t1 - sc.t0 || 1)) * pw;
+  const act = info.anchors.filter((a) => a.rate != null && !a.disabled)
+    .sort((a, b) => a.collected_at - b.collected_at);
+  const used = batch.cycles
+    .map((c) => ({ mid: (c.start + c.end) / 2,
+                   rate: c.result && c.result.blank && c.result.blank.rate,
+                   inc: c.included }))
+    .filter((u) => u.rate != null);
+  const rates = [...act.map((a) => a.rate), ...used.map((u) => u.rate)];
+  if (!rates.length) {
+    const t = el("text", { x: cfg.ml, y: 30, "font-size": 11, fill: "#b3271e" }, svg);
+    t.textContent = "背景序列无可用锚点（均停用或缺少已确认批量均值）。";
+    return;
+  }
+  let y0 = Math.min(...rates), y1 = Math.max(...rates);
+  const pad = (y1 - y0) * 0.2 || 0.01;
+  y0 -= pad; y1 += pad;
+  const Y = (r) => cfg.mt + ph - ((r - y0) / (y1 - y0)) * ph;
+  // 模型曲线（线性插值 / 最近锚点阶梯）
+  if (act.length >= 2) {
+    let pts;
+    if (info.method === "nearest") {
+      pts = [[sc.t0, act[0].rate]];
+      for (let i = 1; i < act.length; i++) {
+        const mid = (act[i - 1].collected_at + act[i].collected_at) / 2;
+        pts.push([mid, act[i - 1].rate], [mid, act[i].rate]);
+      }
+      pts.push([sc.t1, act[act.length - 1].rate]);
+    } else {
+      pts = act.map((a) => [a.collected_at, a.rate]);
+    }
+    el("polyline", { points: pts.map(([t, r]) => `${X(t)},${Y(r)}`).join(" "),
+      fill: "none", stroke: "#8a4b08", "stroke-width": 1.5,
+      "stroke-dasharray": "5 3" }, svg);
+  }
+  // 锚点（菱形；人工锁定深色；停用灰叉于基线）
+  for (const a of info.anchors) {
+    const x = X(a.collected_at);
+    if (a.disabled || a.rate == null) {
+      const y = cfg.mt + ph;
+      el("line", { x1: x - 4, y1: y - 4, x2: x + 4, y2: y + 4, stroke: "#999" }, svg);
+      el("line", { x1: x - 4, y1: y + 4, x2: x + 4, y2: y - 4, stroke: "#999" }, svg);
+      const t = el("text", { x, y: y - 7, "font-size": 9, fill: "#999",
+                             "text-anchor": "middle" }, svg);
+      t.textContent = `A${a.id}${a.disabled ? "停用" : "无速率"}`;
+    } else {
+      const y = Y(a.rate);
+      el("path", { d: `M ${x} ${y - 5} L ${x + 5} ${y} L ${x} ${y + 5} L ${x - 5} ${y} Z`,
+        fill: a.locked_rate != null ? "#b3540e" : "#e8a13a",
+        stroke: "#8a5a00", "stroke-width": 1 }, svg);
+      const t = el("text", { x, y: y - 8, "font-size": 9, fill: "#8a4b08",
+                             "text-anchor": "middle" }, svg);
+      t.textContent = `A${a.id} ${a.rate.toFixed(4)}`;
+    }
+  }
+  // 各周期实际采用速率（绿=计入汇总，红=未计入）
+  for (const u of used) {
+    el("circle", { cx: X(u.mid), cy: Y(u.rate), r: 3.2,
+                   fill: u.inc ? "#2a7a2a" : "#b3271e" }, svg);
+  }
+  // 坐标轴
+  el("line", { x1: cfg.ml, y1: cfg.mt + ph, x2: cfg.ml + pw, y2: cfg.mt + ph, stroke: "#333" }, svg);
+  el("line", { x1: cfg.ml, y1: cfg.mt, x2: cfg.ml, y2: cfg.mt + ph, stroke: "#333" }, svg);
+  for (let i = 0; i <= 2; i++) {
+    const rv = y0 + (y1 - y0) * i / 2;
+    const t = el("text", { x: cfg.ml - 5, y: Y(rv) + 3, "font-size": 9,
+                           "text-anchor": "end", fill: "#666" }, svg);
+    t.textContent = rv.toFixed(4);
+  }
+  const yl = el("text", { x: 12, y: cfg.mt + ph / 2, "font-size": 10, fill: "#666",
+    "text-anchor": "middle",
+    transform: `rotate(-90 12 ${cfg.mt + ph / 2})` }, svg);
+  yl.textContent = "空白速率 (mg/h)";
+}
+
 // ---------------- 总览图交互：拖边界 / 添加周期 / 校准点 ----------------
 
 let bDrag = null;   // {kind:"handle",cid,side} | {kind:"add",t0,t1}
@@ -920,6 +1043,30 @@ function cycleById(cid) {
   return batch.cycles.find((c) => c.id === cid);
 }
 
+function blankSrcText(b) {
+  if (!b) return "—";
+  const an = b.anchors || [];
+  if (b.mode === "linear" && an.length === 2)
+    return `A${an[0].id}↔A${an[1].id} w=${an[1].weight.toFixed(2)}`;
+  if (b.mode === "nearest" && an.length) return `最近A${an[0].id}`;
+  if (b.mode === "single" && an.length) return `唯一A${an[0].id}`;
+  if (b.mode === "none") return "无锚点";
+  if (b.rate != null) return "静态空白";
+  return "—";
+}
+
+function blankTitle(b) {
+  if (!b) return "";
+  const an = (b.anchors || []).map((a) =>
+    `A${a.id}(r${a.rev ?? "?"})@${(+a.t).toFixed(0)}s=${a.rate.toFixed(4)}` +
+    `${a.locked ? " 🔒人工" : ""} w=${a.weight.toFixed(2)}`).join(" ↔ ");
+  const gap = b.gap_s != null ? `；间隔/距离 ${b.gap_s.toFixed(0)}s` : "";
+  if (an) return an + gap;
+  if (b.mode === "none") return "无可用锚点，未做空白修正";
+  if (b.rate != null) return `静态空白室速率 ${b.rate.toFixed(4)} mg/h`;
+  return "";
+}
+
 function renderBatchTable() {
   const box = $("#batch-table");
   if (!batch.cycles.length) {
@@ -930,10 +1077,12 @@ function renderBatchTable() {
   const r2th = parseFloat($("#batch-r2").value) || 0.9;
   let html = `<table><thead><tr>
 <th>计入</th><th>#</th><th>起点 (s)</th><th>终点 (s)</th><th>时长 (s)</th>
-<th>点数</th><th>斜率 (mg/L/s)</th><th>R²</th><th>MO₂ (mg/h)</th><th>离群 z</th>
+<th>点数</th><th>斜率 (mg/L/s)</th><th>R²</th><th>MO₂前 (mg/h)</th>
+<th>MO₂净 (mg/h)</th><th>空白速率</th><th>来源区间</th><th>离群 z</th>
 <th>告警</th><th>锁定</th><th>裁决</th><th>理由</th><th></th></tr></thead><tbody>`;
   for (const c of batch.cycles) {
     const r = c.result || {};
+    const blank = r.blank || null;
     const warns = (c.warnings || []).map((w) =>
       `<span class="wtag" title="${esc(w.msg)}">${esc(WARN_NAMES[w.code] || w.code)}</span>`
     ).join(" ");
@@ -946,7 +1095,10 @@ function renderBatchTable() {
 <td>${r.n ?? "—"}</td>
 <td>${fmt(r.slope, 8)}</td>
 <td class="${r.r2 != null && r.r2 < r2th ? "bad" : ""}">${fmt(r.r2, 4)}</td>
+<td>${fmt(r.mo2_raw, 4)}</td>
 <td><b>${fmt(r.mo2_net, 4)}</b></td>
+<td>${blank && blank.scaled != null ? fmt(blank.scaled, 4) : "—"}</td>
+<td class="src" title="${esc(blankTitle(blank))}">${esc(blankSrcText(blank))}</td>
 <td class="${outlier ? "outlier" : ""}">${c.outlier_z != null ? c.outlier_z.toFixed(2) : "—"}</td>
 <td class="warns">${warns || "—"}</td>
 <td><button class="btn-lock" data-cid="${c.id}" title="${c.locked ? "解锁" : "锁定（重新分段时保留边界）"}">${c.locked ? "🔓" : "🔒"}</button></td>
@@ -1017,7 +1169,12 @@ function renderBatchSummary() {
   const s = batch.summary;
   if (!s || !batch.cycles.length) { box.innerHTML = ""; }
   else {
-    box.innerHTML = `
+    const si = batch.seriesInfo;
+    const seriesCard = si && si.kind === "series"
+      ? `<div class="sum-card"><div class="sum-v">rev${si.series_rev}</div>` +
+        `<div class="sum-k">背景序列·${si.method === "linear" ? "线性插值" : "最近锚点"}</div></div>`
+      : "";
+    box.innerHTML = seriesCard + `
 <div class="sum-card"><div class="sum-v">${s.n_included} / ${s.n_total}</div><div class="sum-k">有效 / 总周期</div></div>
 <div class="sum-card"><div class="sum-v">${fmt(s.mean, 4)}</div><div class="sum-k">均值 MO₂ (mg/h)</div></div>
 <div class="sum-card"><div class="sum-v">${fmt(s.std, 4)}</div><div class="sum-k">标准差</div></div>
@@ -1051,6 +1208,285 @@ function renderBatchVersions(versions) {
       `均值=${fmt(s.mean, 4)}</span>`;
     ul.appendChild(li);
   });
+}
+
+// ------------------------------------------------------------ 空白序列（时变空白校正）
+
+const sv = {
+  id: null,          // 当前编辑的序列 id（null=新建草稿）
+  anchors: [],       // 锚点草稿行
+};
+
+const SPLOT = { w: 1040, h: 240, ml: 60, mr: 20, mt: 24, mb: 34 };
+
+async function initSeriesView() {
+  await loadDatasets();           // 刷新空白室列表与序列列表
+  const sel = $("#series-select");
+  sel.innerHTML = "";
+  for (const s of state.seriesList) {
+    const op = document.createElement("option");
+    op.value = s.id;
+    op.textContent = `${s.name}（rev${s.rev}）`;
+    sel.appendChild(op);
+  }
+  if (sv.id && state.seriesList.some((s) => s.id === sv.id)) {
+    sel.value = sv.id;
+    loadSeriesIntoEditor(sv.id);
+  } else if (state.seriesList.length) {
+    sel.value = state.seriesList[0].id;
+    loadSeriesIntoEditor(state.seriesList[0].id);
+  } else {
+    newSeriesDraft();
+  }
+}
+
+function newSeriesDraft() {
+  sv.id = null;
+  sv.anchors = [];
+  $("#series-select").value = "";
+  $("#series-name").value = "背景序列";
+  $("#series-method").value = "linear";
+  $("#series-maxgap").value = 7200;
+  $("#series-msg").textContent = "";
+  renderAnchorTable();
+  drawSeriesPlot();
+}
+
+function loadSeriesIntoEditor(id) {
+  const s = state.seriesList.find((x) => x.id === +id);
+  if (!s) { newSeriesDraft(); return; }
+  sv.id = s.id;
+  $("#series-name").value = s.name;
+  $("#series-method").value = s.method;
+  $("#series-maxgap").value = s.max_gap_s;
+  sv.anchors = (s.anchors || []).map((a) => ({ ...a }));
+  $("#series-msg").textContent = "";
+  renderAnchorTable();
+  drawSeriesPlot();
+}
+
+$("#series-select").addEventListener("change", () => {
+  if ($("#series-select").value) loadSeriesIntoEditor(+$("#series-select").value);
+});
+$("#btn-series-new").addEventListener("click", newSeriesDraft);
+$("#series-method").addEventListener("change", drawSeriesPlot);
+
+// 锚点当前有效速率：锁定值优先，否则取空白室已确认批量均值
+function anchorRateOf(a) {
+  if (a.locked_rate !== null && a.locked_rate !== "" && a.locked_rate !== undefined)
+    return { rate: +a.locked_rate, src: "人工锁定" };
+  const br = state.blankRates[a.blank_dataset_id];
+  if (br && br.rate != null)
+    return { rate: br.rate, src: `批次v${br.version_id} 均值` };
+  return { rate: null, src: "缺少已确认批量均值" };
+}
+
+function renderAnchorTable() {
+  const box = $("#anchor-table");
+  const blanks = state.datasets.filter((d) => d.is_blank);
+  if (!blanks.length) {
+    box.innerHTML = '<p class="hint">尚无空白室数据集：请先在“曲线分析”页上传并勾选“空白室”。</p>';
+    return;
+  }
+  if (!sv.anchors.length) {
+    box.innerHTML = '<p class="hint">尚无锚点：点“添加锚点”，为每份空白数据填写采集时刻。</p>';
+    return;
+  }
+  let html = `<table><thead><tr>
+<th>锚点</th><th>空白数据集</th><th>采集时刻 (s)</th><th>当前速率 (mg/h)</th>
+<th>锁定值</th><th>停用</th><th>备注</th><th>版本</th><th></th></tr></thead><tbody>`;
+  sv.anchors.forEach((a, i) => {
+    const { rate, src } = anchorRateOf(a);
+    const opts = blanks.map((d) =>
+      `<option value="${d.id}"${+a.blank_dataset_id === d.id ? " selected" : ""}>${esc(d.name)}</option>`
+    ).join("");
+    html += `<tr data-idx="${i}" class="${a.disabled ? "anchor-off" : ""}">
+<td>${a.id ? "A" + a.id : "新" + (i + 1)}</td>
+<td><select class="a-blank">${opts}</select></td>
+<td><input type="number" class="a-time" value="${+a.collected_at || 0}" step="60"></td>
+<td class="a-rate${rate == null ? " missing" : ""}" title="${esc(src)}">${rate != null ? rate.toFixed(4) : src}</td>
+<td><input type="number" class="a-lock" value="${a.locked_rate ?? ""}" placeholder="自动" step="0.001" title="填写后锁定为该人工校正值，留空则自动取批量均值"></td>
+<td><input type="checkbox" class="a-off"${a.disabled ? " checked" : ""} title="停用后该锚点不参与校正"></td>
+<td><input type="text" class="a-note" value="${esc(a.note || "")}"></td>
+<td>${a.rev ? "r" + a.rev : "—"}</td>
+<td><button class="a-del" title="删除该锚点">✕</button></td>
+</tr>`;
+  });
+  html += "</tbody></table>";
+  box.innerHTML = html;
+
+  box.querySelectorAll("tr[data-idx]").forEach((tr) => {
+    const i = +tr.dataset.idx;
+    const a = sv.anchors[i];
+    tr.querySelector(".a-blank").addEventListener("change", (ev) => {
+      a.blank_dataset_id = +ev.target.value;
+      renderAnchorTable(); drawSeriesPlot();
+    });
+    tr.querySelector(".a-time").addEventListener("change", (ev) => {
+      a.collected_at = parseFloat(ev.target.value) || 0;
+      drawSeriesPlot();
+    });
+    tr.querySelector(".a-lock").addEventListener("change", (ev) => {
+      const v = ev.target.value.trim();
+      a.locked_rate = v === "" ? null : parseFloat(v);
+      renderAnchorTable(); drawSeriesPlot();
+    });
+    tr.querySelector(".a-off").addEventListener("change", (ev) => {
+      a.disabled = ev.target.checked;
+      renderAnchorTable(); drawSeriesPlot();
+    });
+    tr.querySelector(".a-note").addEventListener("change", (ev) => {
+      a.note = ev.target.value;
+    });
+    tr.querySelector(".a-del").addEventListener("click", () => {
+      sv.anchors.splice(i, 1);
+      renderAnchorTable(); drawSeriesPlot();
+    });
+  });
+}
+
+$("#btn-anchor-add").addEventListener("click", () => {
+  const blanks = state.datasets.filter((d) => d.is_blank);
+  if (!blanks.length) { alert("请先在“曲线分析”页上传空白室数据"); return; }
+  // 默认时刻：接在现有锚点之后 1 小时
+  const last = sv.anchors.length
+    ? Math.max(...sv.anchors.map((a) => +a.collected_at || 0)) : 0;
+  sv.anchors.push({
+    blank_dataset_id: blanks[0].id,
+    collected_at: sv.anchors.length ? last + 3600 : 0,
+    disabled: false, locked_rate: null, note: "",
+  });
+  renderAnchorTable(); drawSeriesPlot();
+});
+
+// 背景模型预览：锚点速率随采集时刻的变化曲线
+function drawSeriesPlot() {
+  const svg = $("#series-plot");
+  svg.innerHTML = "";
+  const rows = sv.anchors.map((a, i) => ({ ...a, _i: i, ...anchorRateOf(a) }));
+  if (!rows.length) {
+    const t = el("text", { x: 60, y: 40, "font-size": 12, fill: "#888" }, svg);
+    t.textContent = "尚无锚点：点击“添加锚点”，为每份空白数据填写采集时刻。";
+    return;
+  }
+  const cfg = SPLOT;
+  const pw = cfg.w - cfg.ml - cfg.mr, ph = cfg.h - cfg.mt - cfg.mb;
+  const ts = rows.map((a) => +a.collected_at || 0);
+  let t0 = Math.min(...ts), t1 = Math.max(...ts);
+  const padT = (t1 - t0) * 0.1 || 600;
+  t0 -= padT; t1 += padT;
+  const act = rows.filter((a) => !a.disabled && a.rate != null)
+    .sort((x, y) => x.collected_at - y.collected_at);
+  const rates = act.map((a) => a.rate);
+  let y0 = rates.length ? Math.min(...rates) : 0;
+  let y1 = rates.length ? Math.max(...rates) : 0.1;
+  const padY = (y1 - y0) * 0.2 || 0.01;
+  y0 -= padY; y1 += padY;
+  const X = (t) => cfg.ml + ((t - t0) / (t1 - t0 || 1)) * pw;
+  const Y = (r) => cfg.mt + ph - ((r - y0) / (y1 - y0 || 1)) * ph;
+  // 模型曲线（线性插值 / 最近锚点阶梯）
+  const method = $("#series-method").value;
+  if (act.length >= 2) {
+    let pts;
+    if (method === "nearest") {
+      pts = [[t0, act[0].rate]];
+      for (let i = 1; i < act.length; i++) {
+        const mid = (act[i - 1].collected_at + act[i].collected_at) / 2;
+        pts.push([mid, act[i - 1].rate], [mid, act[i].rate]);
+      }
+      pts.push([t1, act[act.length - 1].rate]);
+    } else {
+      pts = act.map((a) => [a.collected_at, a.rate]);
+    }
+    el("polyline", { points: pts.map(([t, r]) => `${X(t).toFixed(1)},${Y(r).toFixed(1)}`).join(" "),
+      fill: "none", stroke: "#8a4b08", "stroke-width": 1.6,
+      "stroke-dasharray": "6 3" }, svg);
+  }
+  // 锚点标记
+  for (const a of rows) {
+    const x = X(+a.collected_at || 0);
+    const label = a.id ? `A${a.id}` : `新${a._i + 1}`;
+    if (a.disabled || a.rate == null) {
+      const y = cfg.mt + ph;
+      el("line", { x1: x - 4, y1: y - 4, x2: x + 4, y2: y + 4, stroke: "#999", "stroke-width": 1.5 }, svg);
+      el("line", { x1: x - 4, y1: y + 4, x2: x + 4, y2: y - 4, stroke: "#999", "stroke-width": 1.5 }, svg);
+      const t = el("text", { x, y: y - 8, "font-size": 10, fill: "#999", "text-anchor": "middle" }, svg);
+      t.textContent = label + (a.disabled ? "（停用）" : "（无速率）");
+    } else {
+      const y = Y(a.rate);
+      el("path", { d: `M ${x} ${y - 6} L ${x + 6} ${y} L ${x} ${y + 6} L ${x - 6} ${y} Z`,
+        fill: (a.locked_rate !== null && a.locked_rate !== "" && a.locked_rate !== undefined)
+          ? "#b3540e" : "#e8a13a",
+        stroke: "#8a5a00", "stroke-width": 1 }, svg);
+      const t = el("text", { x, y: y - 10, "font-size": 10, fill: "#8a4b08", "text-anchor": "middle" }, svg);
+      t.textContent = `${label} ${a.rate.toFixed(4)}`;
+    }
+  }
+  // 坐标轴
+  el("line", { x1: cfg.ml, y1: cfg.mt + ph, x2: cfg.ml + pw, y2: cfg.mt + ph, stroke: "#333" }, svg);
+  el("line", { x1: cfg.ml, y1: cfg.mt, x2: cfg.ml, y2: cfg.mt + ph, stroke: "#333" }, svg);
+  for (let i = 0; i <= 5; i++) {
+    const tv = t0 + (t1 - t0) * i / 5;
+    const tx = el("text", { x: X(tv), y: cfg.mt + ph + 16, "font-size": 10,
+                            "text-anchor": "middle", fill: "#666" }, svg);
+    tx.textContent = tv.toFixed(0);
+    const rv = y0 + (y1 - y0) * i / 5;
+    const ty = el("text", { x: cfg.ml - 6, y: Y(rv) + 3, "font-size": 10,
+                            "text-anchor": "end", fill: "#666" }, svg);
+    ty.textContent = rv.toFixed(4);
+  }
+  const xl = el("text", { x: cfg.ml + pw / 2, y: cfg.h - 4, "font-size": 11,
+                          "text-anchor": "middle", fill: "#666" }, svg);
+  xl.textContent = "采集时刻 (s)";
+  const yl = el("text", { x: 14, y: cfg.mt + ph / 2, "font-size": 11, fill: "#666",
+    "text-anchor": "middle", transform: `rotate(-90 14 ${cfg.mt + ph / 2})` }, svg);
+  yl.textContent = "空白速率 (mg/h)";
+}
+
+$("#btn-series-save").addEventListener("click", async () => {
+  const payload = {
+    id: sv.id,
+    name: $("#series-name").value,
+    method: $("#series-method").value,
+    max_gap_s: parseFloat($("#series-maxgap").value) || 7200,
+    anchors: sv.anchors.map((a) => ({
+      id: a.id || undefined,
+      blank_dataset_id: +a.blank_dataset_id,
+      collected_at: parseFloat(a.collected_at) || 0,
+      disabled: !!a.disabled,
+      locked_rate: (a.locked_rate === "" || a.locked_rate == null) ? null : +a.locked_rate,
+      note: a.note || "",
+    })),
+  };
+  const msg = $("#series-msg");
+  try {
+    const data = await api("/api/series/save", {
+      method: "POST", body: JSON.stringify(payload) });
+    sv.id = data.series.id;
+    msg.className = "msg";
+    msg.textContent = data.changed
+      ? `已保存，序列 rev${data.rev}` : "内容无变化";
+    renderAffected(data.affected, data.changed);
+    await initSeriesView();           // 刷新锚点 rev 与速率显示
+  } catch (e) {
+    msg.textContent = "保存失败: " + e.message;
+    msg.className = "msg err";
+  }
+});
+
+function renderAffected(affected, changed) {
+  const box = $("#series-affected");
+  if (!changed) {
+    box.innerHTML = '<span class="hint">序列无变化，未触发重算。</span>';
+    return;
+  }
+  if (!affected || !affected.length) {
+    box.innerHTML = '<span class="hint">无受影响样本（没有样本引用本序列，或空白速率未变）。</span>';
+    return;
+  }
+  box.innerHTML = "<ul>" + affected.map((a) =>
+    `<li><b>${esc(a.name)}</b>：v${a.from_version} → v${a.new_version}（自动重算，旧版本仍可查阅）</li>`
+  ).join("") + "</ul>";
 }
 
 // ------------------------------------------------------------ 启动
